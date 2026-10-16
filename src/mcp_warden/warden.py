@@ -78,6 +78,9 @@ class Warden:
     # ------------------------------------------------------------------ client -> server
 
     def from_client(self, msg: Any) -> Outcome:
+        if isinstance(msg, dict) and msg.get("method") == "notifications/cancelled":
+            self._on_cancelled(msg)
+            return Outcome(to_server=[msg])
         if not isinstance(msg, dict) or "method" not in msg or "id" not in msg:
             return Outcome(to_server=[msg])
         method = msg["method"]
@@ -107,6 +110,23 @@ class Warden:
         self._pending[_id_key(msg["id"])] = _Pending("tools/call", self._clock(), name, arguments)
         return Outcome(to_server=[msg])
 
+    def _on_cancelled(self, msg: Message) -> None:
+        # A cancelled request may never get a response, so its pending entry would
+        # otherwise live for the rest of the session and the call would go unaudited.
+        params = msg.get("params") or {}
+        if "requestId" not in params:
+            return
+        pending = self._pending.pop(_id_key(params["requestId"]), None)
+        if pending is not None and pending.method == "tools/call":
+            self._audit_call(
+                pending.tool or "",
+                pending.arguments,
+                "allow",
+                cancelled=True,
+                reason=params.get("reason"),
+                latency_ms=round((self._clock() - pending.started) * 1000, 2),
+            )
+
     # ------------------------------------------------------------------ server -> client
 
     def from_server(self, msg: Any) -> Outcome:
@@ -114,12 +134,22 @@ class Warden:
             return Outcome(to_client=[msg])
         pending = self._pending.pop(_id_key(msg["id"]), None)
         if pending is None:
-            return Outcome(to_client=[msg])
+            return Outcome(to_client=[self._redact_unmatched(msg)])
         if pending.method == "tools/list" and isinstance(msg.get("result"), dict):
             return Outcome(to_client=[self._on_tools_list(msg)])
         if pending.method == "tools/call":
             return Outcome(to_client=[self._on_tool_result(msg, pending)])
         return Outcome(to_client=[msg])
+
+    def _redact_unmatched(self, msg: Message) -> Message:
+        """Responses we are not tracking (e.g. arriving after a cancel) still get redacted."""
+        if not self.policy.redact or "result" not in msg:
+            return msg
+        result, hits = self.redactor.redact(msg["result"])
+        if not hits:
+            return msg
+        log.warning("redacted %d secret(s) from an untracked response", hits)
+        return {**msg, "result": result}
 
     def _on_tools_list(self, msg: Message) -> Message:
         result = msg["result"]

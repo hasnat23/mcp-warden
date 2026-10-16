@@ -121,7 +121,7 @@ def test_unrelated_traffic_passes_through(tmp_path):
         assert w.from_client(msg).to_server == [msg]
     server_request = {"jsonrpc": "2.0", "id": 1, "method": "roots/list"}
     assert w.from_server(server_request).to_client == [server_request]
-    unknown_response = {"jsonrpc": "2.0", "id": 42, "result": {}}
+    unknown_response = {"jsonrpc": "2.0", "id": 42, "result": {"content": []}}
     assert w.from_server(unknown_response).to_client == [unknown_response]
 
 
@@ -147,3 +147,31 @@ def test_null_audit_path_writes_nothing(tmp_path):
     w = Warden(policy_from_dict({}), audit=AuditLog(None))
     w.from_client(call(1, "x"))
     assert list(tmp_path.iterdir()) == []
+
+
+def test_cancelled_calls_are_audited_and_not_leaked(tmp_path):
+    w = make(tmp_path)
+    w.from_client(call(11, "slow_search", q="x"))
+    cancel = {
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": 11, "reason": "user aborted"},
+    }
+    assert w.from_client(cancel).to_server == [cancel]
+    assert w._pending == {}
+    event = audit_events(tmp_path)[-1]
+    assert event["tool"] == "slow_search" and event["cancelled"] is True
+    assert event["reason"] == "user aborted"
+
+    # A late response after cancellation is not audited twice, but is still redacted.
+    late = text_result(11, "key AKIAIOSFODNN7EXAMPLE")
+    out = w.from_server(late).to_client[0]
+    assert out["result"]["content"][0]["text"] == "key [REDACTED:aws-access-key]"
+    assert len(audit_events(tmp_path)) == 1
+
+
+def test_cancel_for_unknown_request_is_ignored(tmp_path):
+    w = make(tmp_path)
+    cancel = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 99}}
+    assert w.from_client(cancel).to_server == [cancel]
+    assert (tmp_path / "audit.jsonl").read_text() == ""
