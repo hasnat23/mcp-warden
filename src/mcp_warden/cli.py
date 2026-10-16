@@ -135,16 +135,26 @@ def cmd_scan(args: argparse.Namespace) -> int:
     if lockfile and Path(lockfile).exists():
         findings.extend(Lockfile.load(lockfile).check(tools))
 
+    report: dict[str, Any] | None = None
     if args.format == "json":
-        payload = {
+        report = {
             "version": __version__,
             "target": label,
             "tools": len(tools),
             "findings": [f.to_dict() for f in findings],
         }
-        print(json.dumps(payload, indent=2))
-    else:
+    elif args.format == "sarif":
+        from mcp_warden.sarif import to_sarif
+
+        report = to_sarif(findings, args.sarif_uri or args.tools_json or args.policy or label)
+
+    if report is None:
         _print_text(label, tools, findings)
+    elif args.output:
+        Path(args.output).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _print_text(label, tools, findings)
+    else:
+        print(json.dumps(report, indent=2))
 
     threshold = Severity.parse(args.fail_on)
     return 1 if any(f.severity >= threshold for f in findings) else 0
@@ -201,7 +211,14 @@ def build_parser() -> argparse.ArgumentParser:
     scan = sub.add_parser("scan", help="audit a server's tools and exit non-zero on findings")
     scan.add_argument("-p", "--policy", help="policy YAML (used for its lockfile)")
     scan.add_argument("--lockfile", help="compare against this lockfile")
-    scan.add_argument("--format", choices=("text", "json"), default="text")
+    scan.add_argument("--format", choices=("text", "json", "sarif"), default="text")
+    scan.add_argument(
+        "-o", "--output", help="write the json/sarif report here and print text to stdout"
+    )
+    scan.add_argument(
+        "--sarif-uri",
+        help="file SARIF results point at (default: --tools-json, --policy, or the server name)",
+    )
     scan.add_argument("--fail-on", default="high", help="low|medium|high (default: high)")
     add_target(scan)
     scan.set_defaults(func=cmd_scan)
