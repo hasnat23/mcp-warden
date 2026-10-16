@@ -77,6 +77,7 @@ Requires Python 3.10+. The only runtime dependency is PyYAML.
 mcp-warden scan -- npx -y @modelcontextprotocol/server-filesystem ~/projects
 mcp-warden scan --format json --fail-on medium -- uvx some-mcp-server
 mcp-warden scan --tools-json saved-tools.json      # scan a saved tools/list result
+mcp-warden scan --format sarif -o mcp.sarif -- uvx some-mcp-server   # for code scanning
 ```
 
 **2. Write a policy** (optional; without one you get scanning, redaction and blocking of high-severity tools):
@@ -119,6 +120,35 @@ Here is the real filesystem server behind the example policy, reading a config f
 → read_text_file {"path": "/root/.ssh/id_rsa"}
 ← isError: "Blocked by mcp-warden: argument 'path' of 'read_text_file' denied: credential files are off limits"
 ```
+
+## GitHub Action and code scanning
+
+Gate MCP servers in CI and see findings in the repository's **Security → Code scanning** tab:
+
+```yaml
+name: mcp-security
+on: [push, pull_request]
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+      - uses: hasnat23/mcp-warden@main
+        with:
+          command: npx -y @modelcontextprotocol/server-filesystem .
+          lockfile: warden.lock.json   # optional: fail when a tool definition drifts
+          sarif-uri: .mcp.json         # the file alerts are attached to
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: mcp-warden.sarif
+```
+
+Inputs: `command` or `tools-json`, `lockfile`, `fail-on` (default `high`), `sarif-file`, `sarif-uri`, `python-version`. Locally, the same report comes from `mcp-warden scan --format sarif -o report.sarif -- <server>`.
 
 ## Policy reference
 
@@ -205,7 +235,6 @@ ruff check . && ruff format --check . && mypy
 ## Roadmap
 
 - Streamable HTTP transport (gateway in front of remote MCP servers)
-- SARIF output for GitHub code scanning
 - Multi-server mode: one warden process fronting several servers with per-server policies
 - OpenTelemetry spans for tool calls
 

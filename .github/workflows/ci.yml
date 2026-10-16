@@ -53,3 +53,28 @@ jobs:
       - run: uv run mcp-warden scan --fail-on low -- npx -y @modelcontextprotocol/server-everything
       - name: Poisoned example must fail
         run: "! uv run mcp-warden scan --tools-json examples/poisoned-tools.json"
+
+  action:
+    # Exercise the composite action exactly as a user would.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Clean server passes
+        uses: ./
+        with:
+          command: npx -y @modelcontextprotocol/server-everything
+          fail-on: low
+      - name: Poisoned tools fail
+        id: poisoned
+        continue-on-error: true
+        uses: ./
+        with:
+          tools-json: examples/poisoned-tools.json
+          sarif-file: poisoned.sarif
+      - name: Check the poisoned scan failed and wrote SARIF
+        run: |
+          test "${{ steps.poisoned.outcome }}" = failure
+          python -c "import json; r=json.load(open('poisoned.sarif'))['runs'][0]['results']; assert len(r) == 4, r"
