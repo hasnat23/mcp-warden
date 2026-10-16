@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-warden"
+version = "0.1.0"
+description = "Security gateway for MCP servers: tool policies, prompt-injection scanning, tool pinning, secret redaction and audit logs."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Muhammad Hasnat" }]
+keywords = ["mcp", "model-context-protocol", "llm", "security", "prompt-injection", "ai-agents", "proxy"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["pyyaml>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10", "types-PyYAML"]
+
+[project.scripts]
+mcp-warden = "mcp_warden.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/hasnat23/mcp-warden"
+Issues = "https://github.com/hasnat23/mcp-warden/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_warden"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+files = ["src/mcp_warden"]
