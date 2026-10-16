@@ -1,0 +1,68 @@
+name: mcp-warden scan
+description: Scan MCP server tools for poisoning, prompt injection and rug pulls, with SARIF output for code scanning.
+author: Muhammad Hasnat
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  command:
+    description: Server command to launch over stdio, e.g. "npx -y @modelcontextprotocol/server-filesystem ."
+    required: false
+  tools-json:
+    description: Path to a saved tools/list result to scan instead of launching a server.
+    required: false
+  lockfile:
+    description: Lockfile to compare tool definitions against (detects changed tools).
+    required: false
+  fail-on:
+    description: Fail the step on findings at or above this severity (low, medium, high).
+    default: high
+  sarif-file:
+    description: Where to write the SARIF report. Upload it with github/codeql-action/upload-sarif.
+    default: mcp-warden.sarif
+  sarif-uri:
+    description: Repository file the SARIF results point at (e.g. your MCP config file).
+    required: false
+  python-version:
+    description: Python used to run mcp-warden.
+    default: "3.12"
+
+outputs:
+  sarif-file:
+    description: Path of the SARIF report.
+    value: ${{ inputs.sarif-file }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+    - name: Install mcp-warden
+      shell: bash
+      run: python -m pip install --quiet "${{ github.action_path }}"
+    - name: Scan
+      shell: bash
+      env:
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_TOOLS_JSON: ${{ inputs.tools-json }}
+        INPUT_LOCKFILE: ${{ inputs.lockfile }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_SARIF_FILE: ${{ inputs.sarif-file }}
+        INPUT_SARIF_URI: ${{ inputs.sarif-uri }}
+      run: |
+        args=(scan --format sarif --output "$INPUT_SARIF_FILE" --fail-on "$INPUT_FAIL_ON")
+        [ -n "$INPUT_LOCKFILE" ] && args+=(--lockfile "$INPUT_LOCKFILE")
+        [ -n "$INPUT_SARIF_URI" ] && args+=(--sarif-uri "$INPUT_SARIF_URI")
+        if [ -n "$INPUT_TOOLS_JSON" ]; then
+          args+=(--tools-json "$INPUT_TOOLS_JSON")
+        elif [ -n "$INPUT_COMMAND" ]; then
+          # Word-split the command on purpose: it is a command line, not one argument.
+          read -r -a server <<< "$INPUT_COMMAND"
+          args+=(-- "${server[@]}")
+        else
+          echo "::error::set either 'command' or 'tools-json'"
+          exit 2
+        fi
+        mcp-warden "${args[@]}"
