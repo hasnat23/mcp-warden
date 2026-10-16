@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv && uv pip install -e '.[dev]'
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.13"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv venv && uv pip install -e '.[dev]'
+      - run: uv run pytest -q
+
+  smoke:
+    # Scan the reference MCP servers so a rule change that adds false positives fails CI.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: uv venv && uv pip install -e .
+      - run: uv run mcp-warden scan --fail-on low -- npx -y @modelcontextprotocol/server-filesystem .
+      - run: uv run mcp-warden scan --fail-on low -- npx -y @modelcontextprotocol/server-everything
+      - name: Poisoned example must fail
+        run: "! uv run mcp-warden scan --tools-json examples/poisoned-tools.json"

@@ -1,0 +1,36 @@
+# mcp-warden policy. Docs: https://github.com/hasnat23/mcp-warden#policy-reference
+version: 1
+mode: enforce            # enforce | monitor (log what would be blocked, block nothing)
+
+tools:
+  allow: []              # glob patterns; empty means every tool not denied is allowed
+  deny:
+    - "delete_*"
+    - "*_execute*"
+
+arguments:
+  - tool: "*"
+    deny_pattern: "(^|/)\\.(ssh|aws|gnupg)(/|$)|id_(rsa|ed25519)|\\.env$"
+    reason: "credential files are off limits"
+
+rate_limits:
+  - tool: "*"
+    max_calls: 120
+    per_seconds: 60
+
+scan:
+  descriptions: block    # hide tools whose description looks poisoned
+  results: warn          # block | warn | off
+  block_severity: high   # low | medium | high
+
+redact:
+  enabled: true
+  patterns: []           # extra: [{name: internal-id, pattern: "ACME-[0-9]{8}"}]
+
+pinning:
+  lockfile: warden.lock.json
+  on_change: block       # hide tools whose definition changed since pinning
+
+audit:
+  path: warden-audit.jsonl
+  log_arguments: false
