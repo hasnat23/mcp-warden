@@ -51,6 +51,11 @@ jobs:
       - run: uv venv && uv pip install -e .
       - run: uv run mcp-warden scan --fail-on low -- npx -y @modelcontextprotocol/server-filesystem .
       - run: uv run mcp-warden scan --fail-on low -- npx -y @modelcontextprotocol/server-everything
+      - name: Scan the same server over Streamable HTTP
+        run: |
+          npx -y @modelcontextprotocol/server-everything streamableHttp &
+          for i in $(seq 1 60); do curl -s -o /dev/null localhost:3001 && break; sleep 1; done
+          uv run mcp-warden scan --fail-on low --url http://localhost:3001/mcp
       - name: Poisoned example must fail
         run: "! uv run mcp-warden scan --tools-json examples/poisoned-tools.json"
 

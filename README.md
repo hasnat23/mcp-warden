@@ -47,9 +47,10 @@ flowchart LR
         E --> A[("Audit log<br/>JSONL")]
     end
     P -- "JSON-RPC over stdio" --> S1["MCP server<br/>(child process)"]
+    P -- "Streamable HTTP + SSE" --> S2["Remote MCP server<br/>(--url)"]
 ```
 
-The `Warden` engine is synchronous and transport-agnostic: it takes one decoded JSON-RPC message and returns what to forward to each side. The stdio proxy is a thin asyncio shell around it, which keeps every security decision unit-testable without spawning processes, and leaves room for a Streamable HTTP transport later.
+The `Warden` engine is synchronous and transport-agnostic: it takes one decoded JSON-RPC message and returns what to forward to each side. The stdio proxy and the Streamable HTTP bridge are thin asyncio shells around it, which keeps every security decision unit-testable without spawning processes or servers.
 
 What happens to each message:
 
@@ -103,6 +104,15 @@ mcp-warden init            # writes a commented warden.yaml
 ```
 
 That is the same shape for Claude Desktop (`claude_desktop_config.json`), Cursor (`.cursor/mcp.json`) and Claude Code (`claude mcp add filesystem -- mcp-warden run -p warden.yaml -- npx -y ...`).
+
+**Remote servers.** For an MCP server reached over Streamable HTTP, use `--url` instead of a command. Your client still talks stdio to mcp-warden, which forwards to the remote endpoint with session handling, SSE streaming and any headers you pass:
+
+```bash
+mcp-warden run -p warden.yaml --url https://mcp.example.com/mcp -H "Authorization: Bearer $TOKEN"
+mcp-warden scan --url https://mcp.example.com/mcp -H "Authorization: Bearer $TOKEN"
+```
+
+This also lets stdio-only clients use remote servers, with the same policy, scanning and redaction as local ones.
 
 **4. Pin tool definitions** so any later change is caught:
 
@@ -234,7 +244,7 @@ ruff check . && ruff format --check . && mypy
 
 ## Roadmap
 
-- Streamable HTTP transport (gateway in front of remote MCP servers)
+- Inbound HTTP mode: serve the warden itself over Streamable HTTP, as a shared gateway for a team
 - Multi-server mode: one warden process fronting several servers with per-server policies
 - OpenTelemetry spans for tool calls
 
