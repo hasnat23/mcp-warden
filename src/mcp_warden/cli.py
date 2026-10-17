@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from mcp_warden import __version__
+from mcp_warden.client import MCPError
 from mcp_warden.findings import Finding, Severity
+from mcp_warden.http_transport import TransportError
 from mcp_warden.pinning import Lockfile
 from mcp_warden.policy import PolicyError, load_policy
 from mcp_warden.scanner import scan_tools
@@ -69,13 +71,19 @@ def _configure_logging(verbose: bool, quiet: bool) -> None:
     logging.basicConfig(level=level, format="mcp-warden: %(message)s", stream=sys.stderr)
 
 
+def _headers(args: argparse.Namespace) -> dict[str, str]:
+    from mcp_warden.http_transport import parse_header
+
+    return dict(parse_header(h) for h in args.header or [])
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     from mcp_warden.proxy import run_stdio_proxy
     from mcp_warden.warden import Warden
 
     command = _command(args)
-    if not command:
-        print("mcp-warden run: missing server command after --", file=sys.stderr)
+    if bool(command) == bool(args.url):
+        print("mcp-warden run: give either --url or a server command after --", file=sys.stderr)
         return 2
     policy = load_policy(args.policy)
     if args.monitor:
@@ -84,6 +92,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         policy.audit_path = args.audit
     if args.lockfile:
         policy.lockfile = args.lockfile
+    if args.url:
+        from mcp_warden.http_transport import StreamableHTTP
+        from mcp_warden.proxy import run_http_bridge
+
+        transport = StreamableHTTP(args.url, _headers(args))
+        try:
+            return asyncio.run(run_http_bridge(transport, Warden(policy)))
+        except KeyboardInterrupt:
+            return 130
     try:
         return asyncio.run(run_stdio_proxy(command, Warden(policy)))
     except FileNotFoundError as exc:
@@ -98,9 +115,14 @@ def _load_tools(args: argparse.Namespace) -> tuple[str, list[dict[str, Any]]]:
         data = json.loads(Path(args.tools_json).read_text(encoding="utf-8"))
         tools = data.get("tools", data) if isinstance(data, dict) else data
         return args.tools_json, [t for t in tools if isinstance(t, dict)]
+    if args.url:
+        from mcp_warden.client import fetch_tools_http
+
+        info, tools = fetch_tools_http(args.url, _headers(args), timeout=args.timeout)
+        return f"{info.get('name', args.url)} {info.get('version', '')}".strip(), tools
     command = _command(args)
     if not command:
-        raise SystemExit("mcp-warden: give a server command after -- or --tools-json FILE")
+        raise SystemExit("mcp-warden: give a server command after --, --url URL or --tools-json")
     from mcp_warden.client import fetch_tools
 
     info, tools = asyncio.run(fetch_tools(command, timeout=args.timeout))
@@ -195,16 +217,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-q", "--quiet", action="store_true", help="only log errors")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    run = sub.add_parser("run", help="proxy a stdio MCP server through the policy engine")
+    def add_remote(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--url", help="remote MCP server (Streamable HTTP endpoint)")
+        p.add_argument(
+            "-H",
+            "--header",
+            action="append",
+            metavar="'NAME: VALUE'",
+            help="HTTP header for --url, repeatable (e.g. 'Authorization: Bearer ...')",
+        )
+
+    run = sub.add_parser(
+        "run", help="proxy an MCP server (stdio or --url) through the policy engine"
+    )
     run.add_argument("-p", "--policy", help="policy YAML (default: built-in safe defaults)")
     run.add_argument("--audit", help="audit log path (overrides policy)")
     run.add_argument("--lockfile", help="tool pin lockfile (overrides policy)")
     run.add_argument("--monitor", action="store_true", help="log decisions, block nothing")
+    add_remote(run)
     run.add_argument("command", nargs=argparse.REMAINDER, help="-- server command and args")
     run.set_defaults(func=cmd_run)
 
     def add_target(p: argparse.ArgumentParser) -> None:
         p.add_argument("--tools-json", help="scan a saved tools/list result instead of a server")
+        add_remote(p)
         p.add_argument("--timeout", type=float, default=30.0, help="seconds per request")
         p.add_argument("command", nargs=argparse.REMAINDER, help="-- server command and args")
 
@@ -242,4 +278,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(args.func(args))
     except PolicyError as exc:
         print(f"mcp-warden: invalid policy: {exc}", file=sys.stderr)
+        return 2
+    except (TransportError, MCPError, ValueError) as exc:
+        print(f"mcp-warden: {exc}", file=sys.stderr)
         return 2
