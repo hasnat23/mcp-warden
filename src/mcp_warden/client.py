@@ -1,4 +1,4 @@
-"""Minimal MCP stdio client used by `scan` and `pin` to fetch a server's tools."""
+"""Minimal MCP clients (stdio and Streamable HTTP) used by `scan` and `pin`."""
 
 from __future__ import annotations
 
@@ -117,3 +117,56 @@ async def fetch_tools(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     async with StdioClient(command, timeout=timeout) as client:
         return client.server_info, await client.list_tools()
+
+
+def fetch_tools_http(
+    url: str, headers: dict[str, str] | None = None, timeout: float = 30.0
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fetch a remote Streamable HTTP server's tools (blocking)."""
+    from mcp_warden.http_transport import StreamableHTTP
+
+    transport = StreamableHTTP(url, headers, timeout=timeout)
+    ids = itertools.count(1)
+
+    def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        req_id = next(ids)
+        msg = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+        result: dict[str, Any] | None = None
+        for reply in transport.post(msg):
+            if not isinstance(reply, dict):
+                continue
+            if "method" in reply and "id" in reply:
+                refusal = {
+                    "jsonrpc": "2.0",
+                    "id": reply["id"],
+                    "error": {"code": -32601, "message": "method not supported"},
+                }
+                list(transport.post(refusal))
+            elif reply.get("id") == req_id:
+                if "error" in reply:
+                    raise MCPError(f"server error: {reply['error']}")
+                result = reply.get("result") if isinstance(reply.get("result"), dict) else {}
+        if result is None:
+            raise MCPError(f"no response to {method}")
+        return result
+
+    try:
+        init = request(
+            "initialize",
+            {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "mcp-warden", "version": __version__},
+            },
+        )
+        list(transport.post({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        tools: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            page = request("tools/list", {"cursor": cursor} if cursor else {})
+            tools.extend(t for t in page.get("tools", []) if isinstance(t, dict))
+            cursor = page.get("nextCursor")
+            if not cursor:
+                return init.get("serverInfo", {}), tools
+    finally:
+        transport.close()
