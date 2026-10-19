@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.24"]
+requires = ["hatchling>=1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
@@ -24,17 +24,17 @@ classifiers = [
   "Topic :: Security",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["pyyaml>=6.0"]
+dependencies = ["pyyaml>=6.0.3"]
 
 [project.optional-dependencies]
-otel = ["opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp-proto-http>=1.20"]
+otel = ["opentelemetry-sdk>=1.45.1", "opentelemetry-exporter-otlp-proto-http>=1.45.1"]
 dev = [
-  "pytest>=8",
-  "pytest-asyncio>=0.23",
-  "ruff>=0.6",
-  "mypy>=1.10",
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1.4.0",
+  "ruff>=0.17.1",
+  "mypy>=2.4.0",
   "types-PyYAML",
-  "opentelemetry-sdk>=1.20",
+  "opentelemetry-sdk>=1.45.1",
 ]
 
 [project.scripts]
