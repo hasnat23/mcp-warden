@@ -234,6 +234,17 @@ jq -c 'select(.decision == "deny")' warden-audit.jsonl                 # everyth
 jq -s 'map(select(.event=="tool_call")) | group_by(.tool) | map({tool: .[0].tool, calls: length})' warden-audit.jsonl
 ```
 
+## OpenTelemetry
+
+Install the extra and add `--otel` (or `telemetry: {otel: true}` in the policy) to export one span per tool call:
+
+```bash
+pipx install 'mcp-warden[otel] @ git+https://github.com/hasnat23/mcp-warden'
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 mcp-warden run --otel -p warden.yaml -- <server>
+```
+
+Spans follow the GenAI semantic conventions (`execute_tool <name>`, `gen_ai.operation.name`, `gen_ai.tool.name`) and carry the warden's view: `mcp_warden.decision`, `mcp_warden.redactions`, `mcp_warden.rules`, `mcp_warden.reason`, with `error.type` and an error status on denials, JSON-RPC errors and tool errors. Each `tools/list` gets a span listing hidden tools. The exporter reads the standard `OTEL_*` variables. A global tracer provider (e.g. under `opentelemetry-instrument`) is reused, and nothing is written to stdout. The spans are built from the same redacted records as the audit log, so secrets never reach your tracing backend.
+
 ## Development
 
 ```bash
@@ -246,7 +257,6 @@ ruff check . && ruff format --check . && mypy
 
 - Inbound HTTP mode: serve the warden itself over Streamable HTTP, as a shared gateway for a team
 - Multi-server mode: one warden process fronting several servers with per-server policies
-- OpenTelemetry spans for tool calls
 
 ## License
 
