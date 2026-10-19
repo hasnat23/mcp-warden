@@ -68,7 +68,7 @@ pipx install git+https://github.com/hasnat23/mcp-warden
 # or: uv tool install git+https://github.com/hasnat23/mcp-warden
 ```
 
-Requires Python 3.10+. The only runtime dependency is PyYAML.
+Requires Python 3.10+. The only runtime dependency is PyYAML. For OpenTelemetry export, install the `otel` extra (see [OpenTelemetry](#opentelemetry)). Release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 
