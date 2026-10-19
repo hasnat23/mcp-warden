@@ -12,7 +12,7 @@ import copy
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +27,7 @@ from mcp_warden.scanner import scan_result, scan_tools
 log = logging.getLogger("mcp_warden")
 
 Message = dict[str, Any]
+Sink = Callable[[dict[str, Any]], None]
 
 
 @dataclass
@@ -61,10 +62,14 @@ class Warden:
         policy: Policy,
         *,
         audit: AuditLog | None = None,
+        sinks: Sequence[Sink] = (),
         clock: Callable[[], float] = time.monotonic,
     ):
         self.policy = policy
         self.audit = audit if audit is not None else AuditLog(policy.audit_path)
+        # Extra consumers of every audit record (e.g. OpenTelemetry). They see the
+        # same redacted records as the log and must never break the proxy.
+        self.sinks = list(sinks)
         self.redactor = Redactor.build(policy.redact_extra)
         self.limiter = RateLimiter(policy.rate_limits, clock=clock)
         self.lock = Lockfile.load(policy.lockfile) if policy.lockfile else None
@@ -190,7 +195,7 @@ class Warden:
 
         for f in findings:
             log.warning("[%s] %s %s: %s", f.severity, f.rule, f.tool or "-", f.message)
-        self.audit.write(
+        self._emit(
             "tools_list",
             tools=len(tools),
             hidden=sorted(block_reasons) if policy.enforcing else [],
@@ -258,7 +263,22 @@ class Warden:
             fields["arguments"] = self.redactor.redact(arguments)[0]
         elif isinstance(arguments, dict):
             fields["argument_keys"] = sorted(arguments)
-        self.audit.write("tool_call", tool=tool, decision=decision, **fields)
+        self._emit("tool_call", tool=tool, decision=decision, **fields)
+
+    def _emit(self, event: str, **fields: Any) -> None:
+        record = self.audit.write(event, **fields)
+        for sink in self.sinks:
+            try:
+                sink(record)
+            except Exception:
+                log.exception("audit sink %r failed", sink)
+
+    def close(self) -> None:
+        self.audit.close()
+        for sink in self.sinks:
+            closer = getattr(sink, "close", None)
+            if callable(closer):
+                closer()
 
     def worst_severity(self) -> Severity | None:
         return max((f.severity for f in self.findings), default=None)

@@ -54,6 +54,8 @@ class Policy:
     on_change: Action = "block"
     audit_path: str | None = None
     audit_arguments: bool = False
+    otel: bool = False
+    otel_service_name: str = "mcp-warden"
 
     @property
     def enforcing(self) -> bool:
@@ -160,6 +162,7 @@ def policy_from_dict(data: dict[str, Any], base_dir: Path | None = None) -> Poli
         redact = {"enabled": redact}
     pinning = data.get("pinning") or {}
     audit = data.get("audit") or {}
+    telemetry = data.get("telemetry") or {}
 
     return Policy(
         mode=mode,
@@ -176,6 +179,8 @@ def policy_from_dict(data: dict[str, Any], base_dir: Path | None = None) -> Poli
         on_change=_action(pinning.get("on_change"), "pinning.on_change", "block"),
         audit_path=rel(audit.get("path")),
         audit_arguments=bool(audit.get("log_arguments", False)),
+        otel=bool(telemetry.get("otel", False)),
+        otel_service_name=str(telemetry.get("service_name", "mcp-warden")),
     )
 
 

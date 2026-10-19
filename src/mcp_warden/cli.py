@@ -92,17 +92,28 @@ def cmd_run(args: argparse.Namespace) -> int:
         policy.audit_path = args.audit
     if args.lockfile:
         policy.lockfile = args.lockfile
+    if args.otel:
+        policy.otel = True
+    sinks = []
+    if policy.otel:
+        from mcp_warden.telemetry import OTelSink, TelemetryUnavailable
+
+        try:
+            sinks.append(OTelSink(service_name=policy.otel_service_name))
+        except TelemetryUnavailable as exc:
+            print(f"mcp-warden: {exc}", file=sys.stderr)
+            return 2
     if args.url:
         from mcp_warden.http_transport import StreamableHTTP
         from mcp_warden.proxy import run_http_bridge
 
         transport = StreamableHTTP(args.url, _headers(args))
         try:
-            return asyncio.run(run_http_bridge(transport, Warden(policy)))
+            return asyncio.run(run_http_bridge(transport, Warden(policy, sinks=sinks)))
         except KeyboardInterrupt:
             return 130
     try:
-        return asyncio.run(run_stdio_proxy(command, Warden(policy)))
+        return asyncio.run(run_stdio_proxy(command, Warden(policy, sinks=sinks)))
     except FileNotFoundError as exc:
         print(f"mcp-warden: cannot start server: {exc}", file=sys.stderr)
         return 127
@@ -234,6 +245,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--audit", help="audit log path (overrides policy)")
     run.add_argument("--lockfile", help="tool pin lockfile (overrides policy)")
     run.add_argument("--monitor", action="store_true", help="log decisions, block nothing")
+    run.add_argument(
+        "--otel", action="store_true", help="export spans via OpenTelemetry (OTEL_* env vars)"
+    )
     add_remote(run)
     run.add_argument("command", nargs=argparse.REMAINDER, help="-- server command and args")
     run.set_defaults(func=cmd_run)

@@ -100,7 +100,7 @@ async def run_stdio_proxy(
             except asyncio.TimeoutError:
                 proc.terminate()
                 await proc.wait()
-        warden.audit.close()
+        warden.close()
     log.info("server exited with code %s", proc.returncode)
     return proc.returncode or 0
 
@@ -193,5 +193,5 @@ async def run_http_bridge(
         with contextlib.suppress(asyncio.CancelledError):
             await downstream
         await asyncio.to_thread(transport.close)
-        warden.audit.close()
+        warden.close()
     return 1 if failures else 0

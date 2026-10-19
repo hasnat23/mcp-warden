@@ -27,7 +27,15 @@ classifiers = [
 dependencies = ["pyyaml>=6.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10", "types-PyYAML"]
+otel = ["opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp-proto-http>=1.20"]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "types-PyYAML",
+  "opentelemetry-sdk>=1.20",
+]
 
 [project.scripts]
 mcp-warden = "mcp_warden.cli:main"
@@ -54,3 +62,7 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 strict = true
 python_version = "3.10"
 files = ["src/mcp_warden"]
+
+[[tool.mypy.overrides]]
+module = ["opentelemetry.exporter.*"]
+ignore_missing_imports = true
