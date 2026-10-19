@@ -30,5 +30,5 @@ All notable changes to this project are documented here. The format follows
 - CLI commands `run`, `scan`, `pin` and `init` (#1).
 - SARIF output and a composite GitHub Action for code scanning (#2).
 
-[Unreleased]: https://github.com/hasnat23/mcp-warden/compare/a34f9e4...main
+[Unreleased]: https://github.com/hasnat23/mcp-warden/compare/2b0f14a...main
 [0.1.0]: https://github.com/hasnat23/mcp-warden/tree/2b0f14a
