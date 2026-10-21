@@ -10,6 +10,9 @@ updates:
         patterns: ["*"]
   - package-ecosystem: pip
     directory: /
+    # mcp-warden is a library: keep the lower bounds in pyproject.toml wide and only
+    # raise them when a new release is outside the declared range.
+    versioning-strategy: increase-if-necessary
     schedule:
       interval: weekly
     groups:
