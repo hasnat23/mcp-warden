@@ -245,6 +245,30 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 mcp-warden run --otel -p warde
 
 Spans follow the GenAI semantic conventions (`execute_tool <name>`, `gen_ai.operation.name`, `gen_ai.tool.name`) and carry the warden's view: `mcp_warden.decision`, `mcp_warden.redactions`, `mcp_warden.rules`, `mcp_warden.reason`, with `error.type` and an error status on denials, JSON-RPC errors and tool errors. Each `tools/list` gets a span listing hidden tools. The exporter reads the standard `OTEL_*` variables. A global tracer provider (e.g. under `opentelemetry-instrument`) is reused, and nothing is written to stdout. The spans are built from the same redacted records as the audit log, so secrets never reach your tracing backend.
 
+## Multi-server mode
+
+Put every server behind one warden process and point your client at a single entry. Tools are exposed as `<server>__<tool>`, and each server keeps its own policy, lockfile and rate limits:
+
+```yaml
+# servers.yaml
+policy: warden.yaml                # default for every server
+servers:
+  fs:
+    command: npx -y @modelcontextprotocol/server-filesystem /srv/data
+  github:
+    command: [docker, run, -i, --rm, -e, GITHUB_PERSONAL_ACCESS_TOKEN, ghcr.io/github/github-mcp-server]
+  tracker:
+    url: https://mcp.example.com/mcp
+    headers: {Authorization: "Bearer ${TRACKER_TOKEN}"}
+    policy: strict.yaml            # per-server override
+```
+
+```json
+{ "mcpServers": { "warden": { "command": "mcp-warden", "args": ["run", "--config", "servers.yaml"] } } }
+```
+
+Each audit record and span gets a `server` field (`mcp_warden.server`), so `jq 'select(.server == "tracker")'` filters one upstream. Lockfiles are split per server (`warden.lock.fs.json`, ...) because pins are keyed by tool name. `${VAR}` is expanded in commands, URLs and headers, so tokens stay out of the file. A server that fails to start is logged and left out of the tool list instead of taking the others down. `--monitor`, `--audit`, `--lockfile` and `--otel` apply to every server.
+
 ## Development
 
 ```bash
@@ -256,7 +280,6 @@ ruff check . && ruff format --check . && mypy
 ## Roadmap
 
 - Inbound HTTP mode: serve the warden itself over Streamable HTTP, as a shared gateway for a team
-- Multi-server mode: one warden process fronting several servers with per-server policies
 
 ## License
 

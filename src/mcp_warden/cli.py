@@ -82,20 +82,37 @@ def cmd_run(args: argparse.Namespace) -> int:
     from mcp_warden.warden import Warden
 
     command = _command(args)
-    if bool(command) == bool(args.url):
-        print("mcp-warden run: give either --url or a server command after --", file=sys.stderr)
+    if sum(map(bool, (command, args.url, args.config))) != 1:
+        print(
+            "mcp-warden run: give one of --config, --url or a server command after --",
+            file=sys.stderr,
+        )
         return 2
-    policy = load_policy(args.policy)
-    if args.monitor:
-        policy.mode = "monitor"
-    if args.audit:
-        policy.audit_path = args.audit
-    if args.lockfile:
-        policy.lockfile = args.lockfile
-    if args.otel:
-        policy.otel = True
+    if args.config:
+        if args.policy:
+            print("mcp-warden run: --policy is set per server in --config", file=sys.stderr)
+            return 2
+        from mcp_warden.servers import load_servers, lockfile_for
+
+        specs = load_servers(args.config)
+        policies = [s.policy for s in specs]
+        for spec in specs:
+            if args.lockfile:
+                spec.policy.lockfile = lockfile_for(args.lockfile, spec.name)
+    else:
+        policies = [load_policy(args.policy)]
+    for p in policies:
+        if args.monitor:
+            p.mode = "monitor"
+        if args.audit:
+            p.audit_path = args.audit
+        if args.lockfile and not args.config:
+            p.lockfile = args.lockfile
+        if args.otel:
+            p.otel = True
+    policy = policies[0]
     sinks = []
-    if policy.otel:
+    if any(p.otel for p in policies):
         from mcp_warden.telemetry import OTelSink, TelemetryUnavailable
 
         try:
@@ -103,6 +120,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         except TelemetryUnavailable as exc:
             print(f"mcp-warden: {exc}", file=sys.stderr)
             return 2
+    if args.config:
+        from mcp_warden.gateway import run_gateway
+
+        try:
+            return asyncio.run(run_gateway(specs, sinks=sinks))
+        except KeyboardInterrupt:
+            return 130
     if args.url:
         from mcp_warden.http_transport import StreamableHTTP
         from mcp_warden.proxy import run_http_bridge
@@ -247,6 +271,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--monitor", action="store_true", help="log decisions, block nothing")
     run.add_argument(
         "--otel", action="store_true", help="export spans via OpenTelemetry (OTEL_* env vars)"
+    )
+    run.add_argument(
+        "--config", help="servers YAML: front several servers as one (tools become server__tool)"
     )
     add_remote(run)
     run.add_argument("command", nargs=argparse.REMAINDER, help="-- server command and args")

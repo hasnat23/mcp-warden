@@ -12,6 +12,9 @@ All notable changes to this project are documented here. The format follows
 - OpenTelemetry spans for tool calls and tool listings via `run --otel` or
   `telemetry: {otel: true}`, using the GenAI semantic conventions; optional extra
   `mcp-warden[otel]` (#6).
+- Multi-server mode: `run --config servers.yaml` fronts several stdio and HTTP servers as one,
+  exposing tools as `server__tool` with a policy, lockfile and rate limits per server.
+  Audit records and spans carry the server name.
 
 ### Fixed
 - Cancelled tool calls (`notifications/cancelled`) are audited and no longer leak pending
