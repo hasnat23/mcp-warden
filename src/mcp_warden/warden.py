@@ -64,8 +64,11 @@ class Warden:
         audit: AuditLog | None = None,
         sinks: Sequence[Sink] = (),
         clock: Callable[[], float] = time.monotonic,
+        label: str | None = None,
     ):
         self.policy = policy
+        # Names the upstream server in audit records when one process fronts several.
+        self.label = label
         self.audit = audit if audit is not None else AuditLog(policy.audit_path)
         # Extra consumers of every audit record (e.g. OpenTelemetry). They see the
         # same redacted records as the log and must never break the proxy.
@@ -266,6 +269,8 @@ class Warden:
         self._emit("tool_call", tool=tool, decision=decision, **fields)
 
     def _emit(self, event: str, **fields: Any) -> None:
+        if self.label is not None:
+            fields = {"server": self.label, **fields}
         record = self.audit.write(event, **fields)
         for sink in self.sinks:
             try:

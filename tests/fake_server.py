@@ -1,7 +1,7 @@
 """A tiny stdio MCP server for end-to-end tests.
 
-Tool definitions come from the JSON file in $FAKE_TOOLS (default: two benign
-tools). Calling a tool returns canned text chosen by its name.
+Tool definitions come from the JSON file given as the first argument or in
+$FAKE_TOOLS (default: two benign tools). Calling a tool returns canned text chosen by its name.
 """
 
 import json
@@ -31,7 +31,7 @@ RESPONSES = {
 
 
 def load_tools():
-    path = os.environ.get("FAKE_TOOLS")
+    path = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("FAKE_TOOLS")
     if not path:
         return DEFAULT_TOOLS
     with open(path, encoding="utf-8") as fh:
