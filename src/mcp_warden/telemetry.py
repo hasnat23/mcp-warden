@@ -94,6 +94,10 @@ class OTelSink:
             attrs["mcp_warden.rules"] = _attr_list(f.get("rule") for f in findings)
         if record.get("server"):
             attrs["mcp_warden.server"] = str(record["server"])
+        if record.get("remote"):
+            attrs["client.address"] = str(record["remote"])
+        if record.get("session"):
+            attrs["mcp_warden.session"] = str(record["session"])
         if record.get("reason"):
             attrs["mcp_warden.reason"] = str(record["reason"])
         if record.get("result_blocked"):

@@ -77,6 +77,41 @@ def _headers(args: argparse.Namespace) -> dict[str, str]:
     return dict(parse_header(h) for h in args.header or [])
 
 
+def _load_specs(args: argparse.Namespace) -> list[Any]:
+    from mcp_warden.servers import load_servers, lockfile_for
+
+    specs = load_servers(args.config)
+    if args.lockfile:
+        for spec in specs:
+            spec.policy.lockfile = lockfile_for(args.lockfile, spec.name)
+    return specs
+
+
+def _apply_overrides(args: argparse.Namespace, policies: list[Any]) -> None:
+    for p in policies:
+        if args.monitor:
+            p.mode = "monitor"
+        if args.audit:
+            p.audit_path = args.audit
+        if args.lockfile and not args.config:
+            p.lockfile = args.lockfile
+        if args.otel:
+            p.otel = True
+
+
+def _sinks(policies: list[Any]) -> list[Any] | None:
+    """Audit sinks the policies ask for; None (after printing why) if unavailable."""
+    if not any(p.otel for p in policies):
+        return []
+    from mcp_warden.telemetry import OTelSink, TelemetryUnavailable
+
+    try:
+        return [OTelSink(service_name=policies[0].otel_service_name)]
+    except TelemetryUnavailable as exc:
+        print(f"mcp-warden: {exc}", file=sys.stderr)
+        return None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     from mcp_warden.proxy import run_stdio_proxy
     from mcp_warden.warden import Warden
@@ -88,38 +123,16 @@ def cmd_run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if args.config:
-        if args.policy:
-            print("mcp-warden run: --policy is set per server in --config", file=sys.stderr)
-            return 2
-        from mcp_warden.servers import load_servers, lockfile_for
-
-        specs = load_servers(args.config)
-        policies = [s.policy for s in specs]
-        for spec in specs:
-            if args.lockfile:
-                spec.policy.lockfile = lockfile_for(args.lockfile, spec.name)
-    else:
-        policies = [load_policy(args.policy)]
-    for p in policies:
-        if args.monitor:
-            p.mode = "monitor"
-        if args.audit:
-            p.audit_path = args.audit
-        if args.lockfile and not args.config:
-            p.lockfile = args.lockfile
-        if args.otel:
-            p.otel = True
+    if args.config and args.policy:
+        print("mcp-warden run: --policy is set per server in --config", file=sys.stderr)
+        return 2
+    specs = _load_specs(args) if args.config else []
+    policies = [s.policy for s in specs] or [load_policy(args.policy)]
+    _apply_overrides(args, policies)
     policy = policies[0]
-    sinks = []
-    if any(p.otel for p in policies):
-        from mcp_warden.telemetry import OTelSink, TelemetryUnavailable
-
-        try:
-            sinks.append(OTelSink(service_name=policy.otel_service_name))
-        except TelemetryUnavailable as exc:
-            print(f"mcp-warden: {exc}", file=sys.stderr)
-            return 2
+    sinks = _sinks(policies)
+    if sinks is None:
+        return 2
     if args.config:
         from mcp_warden.gateway import run_gateway
 
@@ -143,6 +156,34 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 127
     except KeyboardInterrupt:
         return 130
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    import os
+
+    from mcp_warden.serve import GatewayServer, run_server
+
+    token = None
+    if args.token_env:
+        token = os.environ.get(args.token_env)
+        if not token:
+            print(f"mcp-warden serve: ${args.token_env} is empty or unset", file=sys.stderr)
+            return 2
+    specs = _load_specs(args)
+    _apply_overrides(args, [s.policy for s in specs])
+    sinks = _sinks([s.policy for s in specs])
+    if sinks is None:
+        return 2
+    server = GatewayServer(
+        specs,
+        host=args.host,
+        port=args.port,
+        path=args.path,
+        sinks=sinks,
+        token=token,
+        allowed_origins=args.allow_origin or [],
+    )
+    return run_server(server)
 
 
 def _load_tools(args: argparse.Namespace) -> tuple[str, list[dict[str, Any]]]:
@@ -278,6 +319,30 @@ def build_parser() -> argparse.ArgumentParser:
     add_remote(run)
     run.add_argument("command", nargs=argparse.REMAINDER, help="-- server command and args")
     run.set_defaults(func=cmd_run)
+
+    serve = sub.add_parser(
+        "serve", help="serve the servers in --config to remote clients over Streamable HTTP"
+    )
+    serve.add_argument("--config", required=True, help="servers YAML (see run --config)")
+    serve.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
+    serve.add_argument("--port", type=int, default=8765, help="bind port (default: 8765)")
+    serve.add_argument("--path", default="/mcp", help="MCP endpoint path (default: /mcp)")
+    serve.add_argument(
+        "--token-env",
+        metavar="VAR",
+        help="require 'Authorization: Bearer <token>' with the token read from $VAR",
+    )
+    serve.add_argument(
+        "--allow-origin",
+        action="append",
+        metavar="ORIGIN",
+        help="browser Origin to accept besides localhost, repeatable ('*' for any)",
+    )
+    serve.add_argument("--audit", help="audit log path (overrides policy)")
+    serve.add_argument("--lockfile", help="tool pin lockfile, split per server")
+    serve.add_argument("--monitor", action="store_true", help="log decisions, block nothing")
+    serve.add_argument("--otel", action="store_true", help="export spans via OpenTelemetry")
+    serve.set_defaults(func=cmd_serve)
 
     def add_target(p: argparse.ArgumentParser) -> None:
         p.add_argument("--tools-json", help="scan a saved tools/list result instead of a server")

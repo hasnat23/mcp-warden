@@ -13,6 +13,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,10 @@ log = logging.getLogger("mcp_warden")
 
 Message = dict[str, Any]
 Sink = Callable[[dict[str, Any]], None]
+
+# Fields about the calling client (e.g. its HTTP session) added to audit records
+# emitted while handling that client's request.
+AUDIT_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar("mcp_warden_audit", default=None)
 
 
 @dataclass
@@ -271,6 +276,9 @@ class Warden:
     def _emit(self, event: str, **fields: Any) -> None:
         if self.label is not None:
             fields = {"server": self.label, **fields}
+        context = AUDIT_CONTEXT.get()
+        if context:
+            fields = {**context, **fields}
         record = self.audit.write(event, **fields)
         for sink in self.sinks:
             try:
