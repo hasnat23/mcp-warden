@@ -229,8 +229,10 @@ class Gateway:
         self._audits: dict[str | None, AuditLog] = {}
         self.wardens: dict[str, Warden] = {}
         self.upstreams: dict[str, Upstream] = {}
-        # client request id -> (server, upstream request id), for cancellation
-        self._calls: dict[str, tuple[str, int]] = {}
+        # (client scope, client request id) -> (server, upstream request id), for cancellation
+        self._calls: dict[tuple[str, str], tuple[str, int]] = {}
+        # Only a client on a persistent stream (stdio) can be told the tool list changed.
+        self.notifies = True
         self._started = False
         for spec in self.specs:
             path = spec.policy.audit_path
@@ -279,13 +281,17 @@ class Gateway:
 
     # ------------------------------------------------------------------ client requests
 
-    async def handle(self, msg: Any) -> Message | None:
-        """Handle one client message and return the response, if it needs one."""
+    async def handle(self, msg: Any, scope: str = "") -> Message | None:
+        """Handle one client message and return the response, if it needs one.
+
+        ``scope`` separates clients that share this gateway (one per HTTP session),
+        since their request ids can collide.
+        """
         if not isinstance(msg, dict) or "method" not in msg:
             return None
         method, params = msg["method"], msg.get("params") or {}
         if method == "notifications/cancelled":
-            await self._cancel(params)
+            await self._cancel(params, scope)
             return None
         if "id" not in msg:
             return None
@@ -298,7 +304,7 @@ class Gateway:
                 "id": msg_id,
                 "result": {
                     "protocolVersion": version if isinstance(version, str) else PROTOCOL_VERSION,
-                    "capabilities": {"tools": {"listChanged": True}},
+                    "capabilities": {"tools": {"listChanged": self.notifies}},
                     "serverInfo": CLIENT_INFO,
                 },
             }
@@ -308,7 +314,7 @@ class Gateway:
             tools = await self.list_tools()
             return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": tools}}
         if method == "tools/call":
-            return await self._call_tool(msg_id, params)
+            return await self._call_tool(msg_id, params, scope)
         empty = {"resources/list": "resources", "resources/templates/list": "resourceTemplates"}
         if method in empty or method == "prompts/list":
             key = empty.get(method, "prompts")
@@ -342,7 +348,7 @@ class Gateway:
             log.error("%s", exc)
         return [{**t, "name": f"{name}{SEP}{t.get('name')}"} for t in tools]
 
-    async def _call_tool(self, client_id: Any, params: Message) -> Message:
+    async def _call_tool(self, client_id: Any, params: Message, scope: str = "") -> Message:
         full = str(params.get("name", ""))
         server, sep, tool = full.partition(SEP)
         if not sep or server not in self.upstreams:
@@ -358,7 +364,7 @@ class Gateway:
         outcome = warden.from_client(msg)
         if outcome.to_client:  # denied by policy
             return {**outcome.to_client[0], "id": client_id}
-        key = repr(client_id)
+        key = (scope, repr(client_id))
         self._calls[key] = (server, upstream_id)
         try:
             reply = await upstream.request(msg)
@@ -375,8 +381,8 @@ class Gateway:
             self._calls.pop(key, None)
         return {**warden.from_server(reply).to_client[0], "id": client_id}
 
-    async def _cancel(self, params: Message) -> None:
-        target = self._calls.get(repr(params.get("requestId")))
+    async def _cancel(self, params: Message, scope: str = "") -> None:
+        target = self._calls.get((scope, repr(params.get("requestId"))))
         if target is None:
             return
         server, upstream_id = target

@@ -15,6 +15,9 @@ All notable changes to this project are documented here. The format follows
 - Multi-server mode: `run --config servers.yaml` fronts several stdio and HTTP servers as one,
   exposing tools as `server__tool` with a policy, lockfile and rate limits per server.
   Audit records and spans carry the server name.
+- `mcp-warden serve`: the multi-server gateway over Streamable HTTP for shared team use, with
+  spec sessions, optional bearer token, Origin checks, `/healthz`, and the caller's address
+  and session in audit records and spans.
 
 ### Fixed
 - Cancelled tool calls (`notifications/cancelled`) are audited and no longer leak pending

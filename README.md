@@ -38,8 +38,10 @@ Clients show a one-time approval dialog and then trust the server. mcp-warden ad
 ```mermaid
 flowchart LR
     C["MCP client<br/>(Claude, Cursor, IDE)"] -- "JSON-RPC over stdio" --> P
+    T["Team clients"] -- "Streamable HTTP<br/>(mcp-warden serve)" --> G
     subgraph W["mcp-warden"]
         P["stdio proxy"] --> E["Warden engine<br/>(pure, transport-agnostic)"]
+        G["HTTP gateway<br/>sessions, auth"] --> E
         E --> S["Scanner<br/>MW001-MW010"]
         E --> L["Lockfile<br/>tool pinning"]
         E --> R["Policy<br/>allow/deny, args, rate limits"]
@@ -50,7 +52,7 @@ flowchart LR
     P -- "Streamable HTTP + SSE" --> S2["Remote MCP server<br/>(--url)"]
 ```
 
-The `Warden` engine is synchronous and transport-agnostic: it takes one decoded JSON-RPC message and returns what to forward to each side. The stdio proxy and the Streamable HTTP bridge are thin asyncio shells around it, which keeps every security decision unit-testable without spawning processes or servers.
+The `Warden` engine is synchronous and transport-agnostic: it takes one decoded JSON-RPC message and returns what to forward to each side. The stdio proxy, the Streamable HTTP bridge, the multi-server gateway and the HTTP server are thin shells around it, which keeps every security decision unit-testable without spawning processes or servers.
 
 What happens to each message:
 
@@ -269,6 +271,27 @@ servers:
 
 Each audit record and span gets a `server` field (`mcp_warden.server`), so `jq 'select(.server == "tracker")'` filters one upstream. Lockfiles are split per server (`warden.lock.fs.json`, ...) because pins are keyed by tool name. `${VAR}` is expanded in commands, URLs and headers, so tokens stay out of the file. A server that fails to start is logged and left out of the tool list instead of taking the others down. `--monitor`, `--audit`, `--lockfile` and `--otel` apply to every server.
 
+## Shared HTTP gateway
+
+`mcp-warden serve` puts the same servers file behind one Streamable HTTP endpoint, so a whole team can point their clients at a single URL. Policies, pins, the audit log and upstream credentials then live in one place instead of on every laptop:
+
+```bash
+export WARDEN_TOKEN=$(openssl rand -hex 32)
+mcp-warden serve --config servers.yaml --host 0.0.0.0 --port 8765 --token-env WARDEN_TOKEN
+```
+
+```json
+{ "mcpServers": { "team": { "type": "http", "url": "https://warden.internal:8765/mcp",
+  "headers": { "Authorization": "Bearer ${WARDEN_TOKEN}" } } } }
+```
+
+- Sessions follow the spec: `initialize` returns an `Mcp-Session-Id`, later requests must send it (400 without, 404 when unknown or ended), and `DELETE` ends it.
+- `--token-env VAR` requires `Authorization: Bearer <token>` (compared in constant time). Binding a non-loopback address without one logs a warning.
+- Browser requests are rejected unless their `Origin` is localhost or listed with `--allow-origin`, which blocks DNS rebinding.
+- Every audit record and span carries the caller's `remote` address and a short `session` id.
+- Upstreams start and their tools are listed once before the port opens, so a poisoned or drifted tool is hidden even from a client that calls it without listing first.
+- `GET /healthz` answers `{"status": "ok"}` for load balancers. Put TLS in front with your usual reverse proxy.
+
 ## Development
 
 ```bash
@@ -279,7 +302,8 @@ ruff check . && ruff format --check . && mypy
 
 ## Roadmap
 
-- Inbound HTTP mode: serve the warden itself over Streamable HTTP, as a shared gateway for a team
+- Per-user tokens with per-user policies in `serve` (OAuth 2.1 resource server)
+- A server-initiated SSE stream in `serve`, to pass `list_changed` and progress notifications to HTTP clients
 
 ## License
 
