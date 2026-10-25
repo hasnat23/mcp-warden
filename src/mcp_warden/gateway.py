@@ -15,7 +15,7 @@ import itertools
 import logging
 import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from typing import Any, BinaryIO
 
 from mcp_warden import __version__
@@ -281,11 +281,14 @@ class Gateway:
 
     # ------------------------------------------------------------------ client requests
 
-    async def handle(self, msg: Any, scope: str = "") -> Message | None:
+    async def handle(
+        self, msg: Any, scope: str = "", allowed: Collection[str] | None = None
+    ) -> Message | None:
         """Handle one client message and return the response, if it needs one.
 
         ``scope`` separates clients that share this gateway (one per HTTP session),
-        since their request ids can collide.
+        since their request ids can collide. ``allowed`` limits the client to some
+        upstream servers; the others are invisible to it.
         """
         if not isinstance(msg, dict) or "method" not in msg:
             return None
@@ -311,18 +314,19 @@ class Gateway:
         if method == "ping":
             return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
         if method == "tools/list":
-            tools = await self.list_tools()
+            tools = await self.list_tools(allowed)
             return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": tools}}
         if method == "tools/call":
-            return await self._call_tool(msg_id, params, scope)
+            return await self._call_tool(msg_id, params, scope, allowed)
         empty = {"resources/list": "resources", "resources/templates/list": "resourceTemplates"}
         if method in empty or method == "prompts/list":
             key = empty.get(method, "prompts")
             return {"jsonrpc": "2.0", "id": msg_id, "result": {key: []}}
         return _error(msg_id, -32601, f"method not found: {method}")
 
-    async def list_tools(self) -> list[Message]:
-        lists = await asyncio.gather(*(self._list_server(name) for name in self.upstreams))
+    async def list_tools(self, allowed: Collection[str] | None = None) -> list[Message]:
+        names = [n for n in self.upstreams if allowed is None or n in allowed]
+        lists = await asyncio.gather(*(self._list_server(name) for name in names))
         return [tool for tools in lists for tool in tools]
 
     async def _list_server(self, name: str) -> list[Message]:
@@ -348,10 +352,22 @@ class Gateway:
             log.error("%s", exc)
         return [{**t, "name": f"{name}{SEP}{t.get('name')}"} for t in tools]
 
-    async def _call_tool(self, client_id: Any, params: Message, scope: str = "") -> Message:
+    async def _call_tool(
+        self,
+        client_id: Any,
+        params: Message,
+        scope: str = "",
+        allowed: Collection[str] | None = None,
+    ) -> Message:
         full = str(params.get("name", ""))
         server, sep, tool = full.partition(SEP)
         if not sep or server not in self.upstreams:
+            return _error(client_id, -32602, f"unknown tool: {full}")
+        if allowed is not None and server not in allowed:
+            # Answer exactly as for a server that does not exist, but keep a record.
+            self.wardens[server]._audit_call(
+                tool, params.get("arguments"), "deny", reason="client may not use this server"
+            )
             return _error(client_id, -32602, f"unknown tool: {full}")
         upstream, warden = self.upstreams[server], self.wardens[server]
         upstream_id = upstream.next_id()

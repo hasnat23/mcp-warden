@@ -286,7 +286,19 @@ mcp-warden serve --config servers.yaml --host 0.0.0.0 --port 8765 --token-env WA
 ```
 
 - Sessions follow the spec: `initialize` returns an `Mcp-Session-Id`, later requests must send it (400 without, 404 when unknown or ended), and `DELETE` ends it.
-- `--token-env VAR` requires `Authorization: Bearer <token>` (compared in constant time). Binding a non-loopback address without one logs a warning.
+- `--token-env VAR` requires `Authorization: Bearer <token>` (compared in constant time). Binding a non-loopback address without any token logs a warning.
+- For a team, give each caller its own token in the servers file instead, optionally limited to some servers. Other servers' tools are invisible to that caller, and calls to them are audited as denied:
+
+  ```yaml
+  clients:
+    alice:
+      token: ${ALICE_TOKEN}                  # read from the environment
+    ci-bot:
+      token_sha256: 3a7bd3e2360a3d29...      # printf %s "$TOKEN" | sha256sum
+      servers: [fs]
+  ```
+
+  Sessions are bound to the client that opened them, so one caller's session id is useless with another caller's token. Each record and span then also names the `user` (`enduser.id`).
 - Browser requests are rejected unless their `Origin` is localhost or listed with `--allow-origin`, which blocks DNS rebinding.
 - Every audit record and span carries the caller's `remote` address and a short `session` id.
 - Upstreams start and their tools are listed once before the port opens, so a poisoned or drifted tool is hidden even from a client that calls it without listing first.
@@ -302,7 +314,7 @@ ruff check . && ruff format --check . && mypy
 
 ## Roadmap
 
-- Per-user tokens with per-user policies in `serve` (OAuth 2.1 resource server)
+- OAuth 2.1 resource server mode for `serve`, so callers can sign in with an identity provider instead of static tokens
 - A server-initiated SSE stream in `serve`, to pass `list_changed` and progress notifications to HTTP clients
 
 ## License

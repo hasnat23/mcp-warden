@@ -7,8 +7,10 @@ Each POST carries one JSON-RPC message (or a batch, for older clients). Requests
 get a JSON response; notifications and responses get 202. ``initialize`` hands
 out an ``Mcp-Session-Id`` that every later request must echo, and DELETE ends
 the session. There is no server-initiated stream, so GET answers 405 as the
-spec allows. Browsers are kept out with an Origin check (DNS rebinding), and a
-bearer token can be required.
+spec allows. Browsers are kept out with an Origin check (DNS rebinding), and
+callers can be required to present a bearer token: one shared token, or one per
+named client, each optionally limited to some servers. Sessions are bound to the
+client that opened them.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from mcp_warden.gateway import Gateway, Message
-from mcp_warden.servers import ServerSpec
+from mcp_warden.servers import ClientSpec, ServerSpec, token_digest
 from mcp_warden.warden import AUDIT_CONTEXT, Sink
 
 log = logging.getLogger("mcp_warden")
@@ -62,16 +64,23 @@ class GatewayServer:
         path: str = "/mcp",
         sinks: Sequence[Sink] = (),
         token: str | None = None,
+        clients: Sequence[ClientSpec] = (),
         allowed_origins: Sequence[str] = (),
         request_timeout: float = 300.0,
     ):
         self.gateway = Gateway(specs, sinks=sinks)
         self.gateway.notifies = False
         self.host, self.port, self.path = host, port, path
-        self.token = token
+        if token is not None and clients:
+            raise ValueError("use a shared token or per-client tokens, not both")
+        self.clients = list(clients)
+        if token is not None:
+            self.clients.append(ClientSpec("", token_digest(token)))
+        self.auth_required = bool(self.clients)
         self.allowed_origins = list(allowed_origins)
         self.request_timeout = request_timeout
-        self.sessions: OrderedDict[str, None] = OrderedDict()
+        # session id -> the client that opened it
+        self.sessions: OrderedDict[str, ClientSpec | None] = OrderedDict()
         self._sessions_lock = threading.Lock()
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(
@@ -121,38 +130,55 @@ class GatewayServer:
 
     # ------------------------------------------------------------------ sessions
 
-    def new_session(self) -> str:
+    def new_session(self, client: ClientSpec | None) -> str:
         sid = secrets.token_urlsafe(24)
         with self._sessions_lock:
-            self.sessions[sid] = None
+            self.sessions[sid] = client
             while len(self.sessions) > MAX_SESSIONS:
                 self.sessions.popitem(last=False)
         return sid
 
-    def has_session(self, sid: str) -> bool:
+    def has_session(self, sid: str, client: ClientSpec | None) -> bool:
+        """A session only exists for the client that opened it."""
         with self._sessions_lock:
-            if sid in self.sessions:
+            if sid in self.sessions and self.sessions[sid] == client:
                 self.sessions.move_to_end(sid)
                 return True
             return False
 
-    def end_session(self, sid: str) -> bool:
+    def end_session(self, sid: str, client: ClientSpec | None) -> bool:
         with self._sessions_lock:
-            return self.sessions.pop(sid, False) is None
+            if sid in self.sessions and self.sessions[sid] == client:
+                del self.sessions[sid]
+                return True
+            return False
 
-    def authorized(self, header: str | None) -> bool:
-        if self.token is None:
-            return True
+    def authenticate(self, header: str | None) -> tuple[bool, ClientSpec | None]:
+        """(ok, client) for an Authorization header; client is None when auth is off."""
+        if not self.auth_required:
+            return True, None
         scheme, _, value = (header or "").partition(" ")
-        return scheme.lower() == "bearer" and hmac.compare_digest(
-            value.strip().encode(), self.token.encode()
-        )
+        if scheme.lower() != "bearer" or not value.strip():
+            return False, None
+        digest = token_digest(value.strip()).encode()
+        found = None
+        for client in self.clients:  # compare against every client, in constant time
+            if hmac.compare_digest(digest, client.token_sha256.encode()):
+                found = client
+        return found is not None, found
 
-    def handle(self, msg: Any, session: str, remote: str) -> Message | None:
+    def handle(
+        self, msg: Any, session: str, remote: str, client: ClientSpec | None = None
+    ) -> Message | None:
+        context: dict[str, Any] = {"session": session[:8], "remote": remote}
+        if client is not None and client.name:
+            context["user"] = client.name
+        allowed = client.servers if client is not None else None
+
         async def run() -> Message | None:
-            token = AUDIT_CONTEXT.set({"session": session[:8], "remote": remote})
+            token = AUDIT_CONTEXT.set(context)
             try:
-                return await self.gateway.handle(msg, scope=session)
+                return await self.gateway.handle(msg, scope=session, allowed=allowed)
             finally:
                 AUDIT_CONTEXT.reset(token)
 
@@ -189,6 +215,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    client: ClientSpec | None = None
+
     def _guard(self) -> bool:
         """Path, Origin and auth checks shared by every MCP method."""
         if urlsplit(self.path).path != self.owner.path:
@@ -197,7 +225,8 @@ class _Handler(BaseHTTPRequestHandler):
         if not origin_allowed(self.headers.get("Origin"), self.owner.allowed_origins):
             self._send(403, _rpc_error(-32600, "origin not allowed"))
             return False
-        if not self.owner.authorized(self.headers.get("Authorization")):
+        ok, self.client = self.owner.authenticate(self.headers.get("Authorization"))
+        if not ok:
             self._send(401, _rpc_error(-32600, "unauthorized"), {"WWW-Authenticate": "Bearer"})
             return False
         return True
@@ -214,7 +243,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._guard():
             return
         sid = self.headers.get(SESSION_HEADER, "")
-        self._send(200 if sid and self.owner.end_session(sid) else 404)
+        self._send(200 if sid and self.owner.end_session(sid, self.client) else 404)
 
     def do_POST(self) -> None:
         if not self._guard():
@@ -240,21 +269,21 @@ class _Handler(BaseHTTPRequestHandler):
             if len(messages) > 1:
                 self._send(400, _rpc_error(-32600, "initialize must not be batched"))
                 return
-            sid = self.owner.new_session()
+            sid = self.owner.new_session(self.client)
             headers[SESSION_HEADER] = sid
         else:
             sid = self.headers.get(SESSION_HEADER, "")
             if not sid:
                 self._send(400, _rpc_error(-32600, f"missing {SESSION_HEADER} header"))
                 return
-            if not self.owner.has_session(sid):
+            if not self.owner.has_session(sid, self.client):
                 self._send(404, _rpc_error(-32001, "session not found"))
                 return
 
         replies = []
         for msg in messages:
             try:
-                reply = self.owner.handle(msg, sid, self.client_address[0])
+                reply = self.owner.handle(msg, sid, self.client_address[0], self.client)
             except Exception as exc:
                 log.exception("request failed")
                 reply = (
@@ -274,7 +303,7 @@ def run_server(server: GatewayServer) -> int:
     import signal
 
     server.start()
-    if server.token is None and server.host not in LOCAL_HOSTS:
+    if not server.auth_required and server.host not in LOCAL_HOSTS:
         log.warning(
             "listening on %s without a token: anyone who can reach it can call tools", server.host
         )

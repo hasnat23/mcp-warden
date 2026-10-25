@@ -18,6 +18,9 @@ All notable changes to this project are documented here. The format follows
 - `mcp-warden serve`: the multi-server gateway over Streamable HTTP for shared team use, with
   spec sessions, optional bearer token, Origin checks, `/healthz`, and the caller's address
   and session in audit records and spans.
+- Per-client tokens for `serve` (`clients:` in the servers file, plain via env vars or as
+  SHA-256 hashes), each optionally limited to some servers. Sessions are bound to their
+  client, and audit records and spans name the `user`.
 
 ### Fixed
 - Cancelled tool calls (`notifications/cancelled`) are audited and no longer leak pending
