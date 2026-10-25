@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -25,6 +26,19 @@ class ServerSpec:
     command: list[str] = field(default_factory=list)
     url: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ClientSpec:
+    """A caller of ``mcp-warden serve``, identified by its bearer token."""
+
+    name: str
+    token_sha256: str
+    servers: frozenset[str] | None = None  # None: every server
+
+
+def token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def lockfile_for(path: str, server: str) -> str:
@@ -91,3 +105,48 @@ def load_servers(path: str | Path) -> list[ServerSpec]:
             )
         )
     return specs
+
+
+def load_clients(path: str | Path, servers: list[ServerSpec]) -> list[ClientSpec]:
+    """Parse the optional ``clients`` section, used by ``serve``::
+
+    clients:
+      alice:
+        token: ${ALICE_TOKEN}         # read from the environment
+      ci:
+        token_sha256: 9f86d08...      # or store only the hash
+        servers: [fs]                 # limit to some servers (default: all)
+    """
+    p = Path(path)
+    data: Any = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    raw_clients = data.get("clients") if isinstance(data, dict) else None
+    if raw_clients is None:
+        return []
+    if not isinstance(raw_clients, dict) or not raw_clients:
+        raise PolicyError(f"{p}: 'clients' must be a non-empty mapping")
+    known = {s.name for s in servers}
+    clients: list[ClientSpec] = []
+    for name, raw in raw_clients.items():
+        name = str(name)
+        if not _NAME.match(name):
+            raise PolicyError(f"client name {name!r} must be 1-32 letters, digits or '-'")
+        if not isinstance(raw, dict) or ("token" in raw) == ("token_sha256" in raw):
+            raise PolicyError(f"clients.{name}: set exactly one of 'token' or 'token_sha256'")
+        if "token" in raw:
+            token = os.path.expandvars(str(raw["token"] or ""))
+            if not token or "$" in token:
+                raise PolicyError(f"clients.{name}: token is empty or its variable is unset")
+            digest = token_digest(token)
+        else:
+            digest = str(raw["token_sha256"]).lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise PolicyError(f"clients.{name}: token_sha256 must be 64 hex characters")
+        allowed = None
+        if raw.get("servers") is not None:
+            allowed = frozenset(str(s) for s in raw["servers"])
+            if unknown := sorted(allowed - known):
+                raise PolicyError(f"clients.{name}: unknown server(s) {', '.join(unknown)}")
+        if any(c.token_sha256 == digest for c in clients):
+            raise PolicyError(f"clients.{name}: token is shared with another client")
+        clients.append(ClientSpec(name, digest, allowed))
+    return clients

@@ -98,6 +98,8 @@ class OTelSink:
             attrs["client.address"] = str(record["remote"])
         if record.get("session"):
             attrs["mcp_warden.session"] = str(record["session"])
+        if record.get("user"):
+            attrs["enduser.id"] = str(record["user"])
         if record.get("reason"):
             attrs["mcp_warden.reason"] = str(record["reason"])
         if record.get("result_blocked"):

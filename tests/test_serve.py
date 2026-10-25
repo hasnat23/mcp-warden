@@ -172,3 +172,94 @@ def test_serve_cli_requires_token_when_asked(tmp_path, monkeypatch, capsys):
     cfg.write_text("servers: {a: {command: x}}\n")
     assert main(["serve", "--config", str(cfg), "--token-env", "WARDEN_TOKEN"]) == 2
     assert "WARDEN_TOKEN" in capsys.readouterr().err
+
+
+def test_per_client_tokens_scope_servers_and_sessions(make_server, tmp_path):
+    from mcp_warden.servers import ClientSpec, token_digest
+
+    clients = [
+        ClientSpec("alice", token_digest("alice-token")),
+        ClientSpec("ci", token_digest("ci-token"), frozenset({"local"})),
+    ]
+    server = make_server(clients=clients)
+    assert raw(server.url, body=INIT, headers={"Authorization": "Bearer nope"})[0] == 401
+
+    alice = StreamableHTTP(server.url, {"Authorization": "Bearer alice-token"})
+    ci = StreamableHTTP(server.url, {"Authorization": "Bearer ci-token"})
+    rpc(alice, INIT)
+    rpc(ci, INIT)
+    listing = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    assert len(rpc(alice, listing)["result"]["tools"]) == 3
+    ci_tools = sorted(t["name"] for t in rpc(ci, listing)["result"]["tools"])
+    assert ci_tools == ["local__get_env", "local__read_file"]
+
+    denied = rpc(ci, call(2, "shady__get_env"))
+    assert denied["error"]["code"] == -32602
+    assert "REDACTED" in rpc(alice, call(2, "shady__get_env"))["result"]["content"][0]["text"]
+
+    # A session belongs to the client that opened it.
+    stolen = {"Authorization": "Bearer ci-token", "Mcp-Session-Id": alice.session_id}
+    ping = {"jsonrpc": "2.0", "id": 3, "method": "ping"}
+    assert raw(server.url, body=ping, headers=stolen)[0] == 404
+    assert raw(server.url, method="DELETE", headers=stolen)[0] == 404
+
+    records = [json.loads(x) for x in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    calls = [(r["user"], r["server"], r["decision"]) for r in records if r["event"] == "tool_call"]
+    assert ("ci", "shady", "deny") in calls and ("alice", "shady", "allow") in calls
+
+
+def test_shared_token_and_clients_are_exclusive():
+    from mcp_warden.servers import ClientSpec
+
+    with pytest.raises(ValueError):
+        GatewayServer([], token="t", clients=[ClientSpec("a", "0" * 64)])
+
+
+def write_clients(tmp_path, clients_yaml):
+    cfg = tmp_path / "servers.yaml"
+    cfg.write_text("servers:\n  fs: {command: x}\n  db: {command: y}\n" + clients_yaml)
+    return cfg
+
+
+def test_load_clients(tmp_path, monkeypatch):
+    from mcp_warden.servers import load_clients, load_servers, token_digest
+
+    monkeypatch.setenv("ALICE_TOKEN", "a1")
+    cfg = write_clients(
+        tmp_path,
+        "clients:\n"
+        "  alice: {token: '${ALICE_TOKEN}'}\n"
+        f"  ci: {{token_sha256: {token_digest('c1').upper()}, servers: [fs]}}\n",
+    )
+    alice, ci = load_clients(cfg, load_servers(cfg))
+    assert alice.token_sha256 == token_digest("a1") and alice.servers is None
+    assert ci.token_sha256 == token_digest("c1") and ci.servers == {"fs"}
+    assert load_clients(write_clients(tmp_path, ""), []) == []
+
+
+@pytest.mark.parametrize(
+    "clients_yaml, error",
+    [
+        ("clients: {a: {token: '${UNSET_WARDEN_VAR}'}}\n", "unset"),
+        ("clients: {a: {token: x, token_sha256: y}}\n", "exactly one"),
+        ("clients: {a: {token_sha256: abc}}\n", "64 hex"),
+        ("clients: {a: {token: x, servers: [web]}}\n", "unknown server"),
+        ("clients: {a: {token: x}, b: {token: x}}\n", "shared"),
+        ("clients: {}\n", "non-empty"),
+    ],
+)
+def test_load_clients_rejects_bad_config(tmp_path, monkeypatch, clients_yaml, error):
+    from mcp_warden.policy import PolicyError
+    from mcp_warden.servers import load_clients, load_servers
+
+    monkeypatch.delenv("UNSET_WARDEN_VAR", raising=False)
+    cfg = write_clients(tmp_path, clients_yaml)
+    with pytest.raises(PolicyError, match=error):
+        load_clients(cfg, load_servers(cfg))
+
+
+def test_serve_cli_rejects_token_env_with_clients(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WARDEN_TOKEN", "t")
+    cfg = write_clients(tmp_path, "clients: {a: {token: x}}\n")
+    assert main(["serve", "--config", str(cfg), "--token-env", "WARDEN_TOKEN"]) == 2
+    assert "cannot be combined" in capsys.readouterr().err

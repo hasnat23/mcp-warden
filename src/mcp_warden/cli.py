@@ -169,7 +169,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if not token:
             print(f"mcp-warden serve: ${args.token_env} is empty or unset", file=sys.stderr)
             return 2
+    from mcp_warden.servers import load_clients
+
     specs = _load_specs(args)
+    clients = load_clients(args.config, specs)
+    if clients and token:
+        print(
+            "mcp-warden serve: --token-env cannot be combined with 'clients' in --config",
+            file=sys.stderr,
+        )
+        return 2
     _apply_overrides(args, [s.policy for s in specs])
     sinks = _sinks([s.policy for s in specs])
     if sinks is None:
@@ -181,6 +190,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         path=args.path,
         sinks=sinks,
         token=token,
+        clients=clients,
         allowed_origins=args.allow_origin or [],
     )
     return run_server(server)
