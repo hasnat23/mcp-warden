@@ -3,6 +3,7 @@
 import json
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -86,7 +87,7 @@ def test_session_flow_through_our_own_client(make_server, tmp_path):
     server = make_server()
     client = StreamableHTTP(server.url)
     init = rpc(client, INIT)
-    assert client.session_id and init["result"]["capabilities"]["tools"]["listChanged"] is False
+    assert client.session_id and init["result"]["capabilities"]["tools"]["listChanged"]
     assert list(client.post({"jsonrpc": "2.0", "method": "notifications/initialized"})) == []
 
     tools = rpc(client, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]
@@ -263,3 +264,93 @@ def test_serve_cli_rejects_token_env_with_clients(tmp_path, monkeypatch, capsys)
     cfg = write_clients(tmp_path, "clients: {a: {token: x}}\n")
     assert main(["serve", "--config", str(cfg), "--token-env", "WARDEN_TOKEN"]) == 2
     assert "cannot be combined" in capsys.readouterr().err
+
+
+def with_progress(msg_id, name, token):
+    msg = call(msg_id, name)
+    msg["params"]["_meta"] = {"progressToken": token}
+    return msg
+
+
+def test_tool_call_streams_progress_then_result(make_server):
+    server = make_server()
+    client = StreamableHTTP(server.url)
+    rpc(client, INIT)
+    out = list(client.post(with_progress(1, "local__get_env", "tok-1")))
+    assert [m.get("method") for m in out] == ["notifications/progress"] * 2 + [None]
+    assert {m["params"]["progressToken"] for m in out[:2]} == {"tok-1"}
+    assert "ghp_" not in json.dumps(out) and "REDACTED" in out[1]["params"]["message"]
+    assert out[2]["id"] == 1 and "result" in out[2]
+
+    # A client that only takes JSON still gets its result, without the progress.
+    headers = {"Mcp-Session-Id": client.session_id, "Accept": "application/json"}
+    status, _, reply = raw(server.url, body=with_progress(2, "local__get_env", 5), headers=headers)
+    assert status == 200 and reply["id"] == 2
+
+
+class SSEReader:
+    """Reads the data events of a GET stream on a background thread."""
+
+    def __init__(self, url, headers):
+        req = urllib.request.Request(
+            url, headers={"Accept": "text/event-stream", **headers}, method="GET"
+        )
+        self.resp = urllib.request.urlopen(req, timeout=10)
+        self.events = []
+        self.ended = threading.Event()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        try:
+            for line in self.resp:
+                if line.startswith(b"data:"):
+                    self.events.append(json.loads(line[5:]))
+        except OSError:
+            pass
+        self.ended.set()
+
+    def wait_for(self, count, timeout=10):
+        deadline = time.monotonic() + timeout
+        while len(self.events) < count and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return self.events
+
+
+def test_standing_stream_gets_list_changed_for_allowed_servers(make_server):
+    from mcp_warden.servers import ClientSpec, token_digest
+
+    server = make_server(
+        clients=[
+            ClientSpec("alice", token_digest("a")),
+            ClientSpec("ci", token_digest("c"), frozenset({"local"})),
+        ]
+    )
+    alice = StreamableHTTP(server.url, {"Authorization": "Bearer a"})
+    ci = StreamableHTTP(server.url, {"Authorization": "Bearer c"})
+    rpc(alice, INIT)
+    rpc(ci, INIT)
+    auth = {"Authorization": "Bearer a"}
+    assert raw(server.url, method="GET", headers=auth)[0] == 405  # no Accept
+    no_session = urllib.request.Request(
+        server.url, method="GET", headers={**auth, "Accept": "text/event-stream"}
+    )
+    with pytest.raises(urllib.error.HTTPError) as err:
+        urllib.request.urlopen(no_session, timeout=10)
+    assert err.value.code == 400
+
+    alice_stream = SSEReader(server.url, {**auth, "Mcp-Session-Id": alice.session_id})
+    ci_stream = SSEReader(
+        server.url, {"Authorization": "Bearer c", "Mcp-Session-Id": ci.session_id}
+    )
+    time.sleep(0.2)  # let both streams register
+    rpc(alice, call(1, "shady__announce"))
+    rpc(alice, call(2, "local__announce"))
+    changed = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+    assert alice_stream.wait_for(2) == [changed, changed]
+    assert ci_stream.wait_for(1) == [changed]
+    time.sleep(0.3)
+    assert ci_stream.events == [changed]  # nothing from the server ci cannot use
+
+    # Ending the session ends its stream.
+    alice.close()
+    assert alice_stream.ended.wait(5)

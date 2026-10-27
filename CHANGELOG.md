@@ -21,11 +21,16 @@ All notable changes to this project are documented here. The format follows
 - Per-client tokens for `serve` (`clients:` in the servers file, plain via env vars or as
   SHA-256 hashes), each optionally limited to some servers. Sessions are bound to their
   client, and audit records and spans name the `user`.
+- SSE streams in `serve`: tool calls with a progress token stream their progress before the
+  result, and a `GET` stream carries `tools/list_changed` and log messages per client.
+  Progress tokens are rewritten per call and progress messages are redacted.
 
 ### Fixed
 - Cancelled tool calls (`notifications/cancelled`) are audited and no longer leak pending
   state; responses with an untracked id are still redacted (#3, #4).
 - Transport and server errors in the CLI print a one-line message instead of a traceback (#5).
+- Notifications from HTTP upstreams in multi-server mode are written from the event loop
+  instead of a worker thread, so they cannot interleave with other output.
 
 ## [0.1.0] - 2026-10-16
 

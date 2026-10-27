@@ -33,8 +33,9 @@ Message = dict[str, Any]
 Notify = Callable[[str, Message], None]
 
 CLIENT_INFO = {"name": "mcp-warden", "version": __version__}
-# Upstream notifications worth passing on to the client.
-FORWARDED = ("notifications/progress", "notifications/message")
+# Where an upstream notification goes: (message, client scope or None for every
+# client, upstream server name).
+Deliver = Callable[[Message, "str | None", str], None]
 
 
 class UpstreamError(RuntimeError):
@@ -226,12 +227,19 @@ class Gateway:
         self.specs = list(specs)
         self.sinks = list(sinks)
         self._write = write or (lambda m: None)
+        # Overridable routing of notifications to clients; stdio has a single client.
+        self.deliver: Deliver = lambda msg, scope, server: self._write(msg)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # Progress tokens are rewritten per call, because clients sharing an upstream
+        # may pick the same ones: gateway token -> (client scope, client's token).
+        self._progress: dict[str, tuple[str, Any]] = {}
+        self._progress_ids = itertools.count(1)
         self._audits: dict[str | None, AuditLog] = {}
         self.wardens: dict[str, Warden] = {}
         self.upstreams: dict[str, Upstream] = {}
         # (client scope, client request id) -> (server, upstream request id), for cancellation
         self._calls: dict[tuple[str, str], tuple[str, int]] = {}
-        # Only a client on a persistent stream (stdio) can be told the tool list changed.
+        # Whether clients can be told the tool list changed (stdio, or serve's GET stream).
         self.notifies = True
         self._started = False
         for spec in self.specs:
@@ -256,6 +264,7 @@ class Gateway:
         if self._started:
             return
         self._started = True
+        self._loop = asyncio.get_running_loop()
         results = await asyncio.gather(
             *(u.start() for u in self.upstreams.values()), return_exceptions=True
         )
@@ -273,11 +282,37 @@ class Gateway:
                 closer()
 
     def _upstream_notification(self, server: str, msg: Message) -> None:
+        # HTTP upstreams report from worker threads; deliver on the loop, in order.
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is not loop:
+                loop.call_soon_threadsafe(self._route_notification, server, msg)
+                return
+        self._route_notification(server, msg)
+
+    def _route_notification(self, server: str, msg: Message) -> None:
         method = msg.get("method")
         if method == "notifications/tools/list_changed":
-            self._write({"jsonrpc": "2.0", "method": method})
-        elif method in FORWARDED:
-            self._write(msg)
+            self.deliver({"jsonrpc": "2.0", "method": method}, None, server)
+            return
+        if method not in ("notifications/progress", "notifications/message"):
+            return
+        warden = self.wardens[server]
+        if warden.policy.redact:
+            msg = {**msg, "params": warden.redactor.redact(msg.get("params"))[0]}
+        if method == "notifications/message":
+            self.deliver(msg, None, server)
+            return
+        params = msg.get("params") or {}
+        target = self._progress.get(str(params.get("progressToken")))
+        if target is None:
+            return  # not a call we made, or it already finished
+        scope, token = target
+        self.deliver({**msg, "params": {**params, "progressToken": token}}, scope, server)
 
     # ------------------------------------------------------------------ client requests
 
@@ -371,17 +406,21 @@ class Gateway:
             return _error(client_id, -32602, f"unknown tool: {full}")
         upstream, warden = self.upstreams[server], self.wardens[server]
         upstream_id = upstream.next_id()
-        msg = {
-            "jsonrpc": "2.0",
-            "id": upstream_id,
-            "method": "tools/call",
-            "params": {**params, "name": tool},
-        }
+        forwarded = {**params, "name": tool}
+        meta = params.get("_meta")
+        progress = None
+        if isinstance(meta, dict) and "progressToken" in meta:
+            progress = f"mcp-warden-{next(self._progress_ids)}"
+            forwarded["_meta"] = {**meta, "progressToken": progress}
+        msg = {"jsonrpc": "2.0", "id": upstream_id, "method": "tools/call", "params": forwarded}
         outcome = warden.from_client(msg)
         if outcome.to_client:  # denied by policy
             return {**outcome.to_client[0], "id": client_id}
         key = (scope, repr(client_id))
         self._calls[key] = (server, upstream_id)
+        if progress is not None:
+            assert isinstance(meta, dict)
+            self._progress[progress] = (scope, meta["progressToken"])
         try:
             reply = await upstream.request(msg)
         except UpstreamError as exc:
@@ -395,6 +434,8 @@ class Gateway:
             return _error(client_id, -32000, f"mcp-warden upstream error: {exc}")
         finally:
             self._calls.pop(key, None)
+            if progress is not None:
+                self._progress.pop(progress, None)
         return {**warden.from_server(reply).to_client[0], "id": client_id}
 
     async def _cancel(self, params: Message, scope: str = "") -> None:

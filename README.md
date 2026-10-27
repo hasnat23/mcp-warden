@@ -286,6 +286,8 @@ mcp-warden serve --config servers.yaml --host 0.0.0.0 --port 8765 --token-env WA
 ```
 
 - Sessions follow the spec: `initialize` returns an `Mcp-Session-Id`, later requests must send it (400 without, 404 when unknown or ended), and `DELETE` ends it.
+- Long tool calls report progress. A call with a `progressToken` from a client that accepts `text/event-stream` is answered with an SSE stream of its progress notifications, then the result. Tokens are rewritten on the way upstream, so clients that pick the same token never see each other's progress, and progress messages are redacted like results.
+- A `GET` with the session id opens a standing SSE stream that carries `notifications/tools/list_changed` and server log messages, limited to the servers that client may use.
 - `--token-env VAR` requires `Authorization: Bearer <token>` (compared in constant time). Binding a non-loopback address without any token logs a warning.
 - For a team, give each caller its own token in the servers file instead, optionally limited to some servers. Other servers' tools are invisible to that caller, and calls to them are audited as denied:
 
@@ -315,7 +317,6 @@ ruff check . && ruff format --check . && mypy
 ## Roadmap
 
 - OAuth 2.1 resource server mode for `serve`, so callers can sign in with an identity provider instead of static tokens
-- A server-initiated SSE stream in `serve`, to pass `list_changed` and progress notifications to HTTP clients
 
 ## License
 

@@ -63,6 +63,15 @@ def main():
         elif method == "tools/call":
             name = msg["params"]["name"]
             args = msg["params"].get("arguments") or {}
+            token = (msg["params"].get("_meta") or {}).get("progressToken")
+            if token is not None:
+                for step in (1, 2):
+                    progress = {"progressToken": token, "progress": step, "total": 2}
+                    if step == 2:
+                        progress["message"] = "using ghp_" + "b" * 36
+                    send({"jsonrpc": "2.0", "method": "notifications/progress", "params": progress})
+            if name == "announce":
+                send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
             text = RESPONSES.get(name, "ok").format(**args)
             result = {"content": [{"type": "text", "text": text}], "isError": False}
         else:

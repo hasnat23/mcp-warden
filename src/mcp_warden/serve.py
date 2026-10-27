@@ -6,11 +6,16 @@ URL, and one place holds the policies, pins, audit log and upstream credentials.
 Each POST carries one JSON-RPC message (or a batch, for older clients). Requests
 get a JSON response; notifications and responses get 202. ``initialize`` hands
 out an ``Mcp-Session-Id`` that every later request must echo, and DELETE ends
-the session. There is no server-initiated stream, so GET answers 405 as the
-spec allows. Browsers are kept out with an Origin check (DNS rebinding), and
-callers can be required to present a bearer token: one shared token, or one per
-named client, each optionally limited to some servers. Sessions are bound to the
-client that opened them.
+the session. A tool call that carries a progress token, from a client that
+accepts ``text/event-stream``, is answered with an SSE stream: its progress
+notifications, then the result. A GET with the session id opens the session's
+standing stream, which carries ``tools/list_changed`` and log messages from the
+servers that client may use.
+
+Browsers are kept out with an Origin check (DNS rebinding), and callers can be
+required to present a bearer token: one shared token, or one per named client,
+each optionally limited to some servers. Sessions are bound to the client that
+opened them.
 """
 
 from __future__ import annotations
@@ -20,10 +25,13 @@ import contextlib
 import hmac
 import json
 import logging
+import queue
 import secrets
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Sequence
+from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
@@ -38,6 +46,10 @@ SESSION_HEADER = "Mcp-Session-Id"
 MAX_BODY = 8 * 1024 * 1024
 MAX_SESSIONS = 10_000
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+KEEPALIVE = 15.0  # seconds between SSE comments on an idle stream
+_DONE = object()  # ends a call's progress stream; None ends a standing stream
+
+Stream = queue.Queue[Any]
 
 
 def origin_allowed(origin: str | None, allowed: Sequence[str]) -> bool:
@@ -69,7 +81,7 @@ class GatewayServer:
         request_timeout: float = 300.0,
     ):
         self.gateway = Gateway(specs, sinks=sinks)
-        self.gateway.notifies = False
+        self.gateway.deliver = self._deliver
         self.host, self.port, self.path = host, port, path
         if token is not None and clients:
             raise ValueError("use a shared token or per-client tokens, not both")
@@ -82,6 +94,11 @@ class GatewayServer:
         # session id -> the client that opened it
         self.sessions: OrderedDict[str, ClientSpec | None] = OrderedDict()
         self._sessions_lock = threading.Lock()
+        # Standing GET streams per session, and per-call progress streams keyed by
+        # (session, the client's progress token).
+        self._streams: dict[str, list[Stream]] = {}
+        self._call_streams: dict[tuple[str, str], Stream] = {}
+        self._streams_lock = threading.Lock()
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(
             target=self._loop.run_forever, name="mcp-warden-gateway", daemon=True
@@ -118,6 +135,10 @@ class GatewayServer:
             threading.Thread(target=self._httpd.shutdown, daemon=True).start()
 
     def close(self) -> None:
+        with self._streams_lock:
+            for streams in self._streams.values():
+                for stream in streams:
+                    stream.put(None)
         if self._httpd is not None:
             self._httpd.server_close()
         with contextlib.suppress(Exception):
@@ -148,10 +169,63 @@ class GatewayServer:
 
     def end_session(self, sid: str, client: ClientSpec | None) -> bool:
         with self._sessions_lock:
-            if sid in self.sessions and self.sessions[sid] == client:
-                del self.sessions[sid]
-                return True
-            return False
+            if sid not in self.sessions or self.sessions[sid] != client:
+                return False
+            del self.sessions[sid]
+        with self._streams_lock:
+            for stream in self._streams.pop(sid, []):
+                stream.put(None)
+        return True
+
+    # ------------------------------------------------------------------ streams
+
+    def open_stream(self, sid: str) -> Stream:
+        stream: Stream = queue.Queue()
+        with self._streams_lock:
+            self._streams.setdefault(sid, []).append(stream)
+        return stream
+
+    def close_stream(self, sid: str, stream: Stream) -> None:
+        with self._streams_lock:
+            streams = self._streams.get(sid, [])
+            if stream in streams:
+                streams.remove(stream)
+            if not streams:
+                self._streams.pop(sid, None)
+
+    def open_call_stream(self, sid: str, token: Any) -> Stream:
+        stream: Stream = queue.Queue()
+        with self._streams_lock:
+            self._call_streams[(sid, repr(token))] = stream
+        return stream
+
+    def close_call_stream(self, sid: str, token: Any) -> None:
+        with self._streams_lock:
+            self._call_streams.pop((sid, repr(token)), None)
+
+    def _may_use(self, sid: str, server: str) -> bool:
+        with self._sessions_lock:
+            if sid not in self.sessions:
+                return False
+            client = self.sessions[sid]
+        return client is None or client.servers is None or server in client.servers
+
+    def _deliver(self, msg: Message, scope: str | None, server: str) -> None:
+        """Route an upstream notification (runs on the gateway loop)."""
+        with self._streams_lock:
+            if scope is not None:
+                token = repr((msg.get("params") or {}).get("progressToken"))
+                call = self._call_streams.get((scope, token))
+                targets = [call] if call is not None else list(self._streams.get(scope, []))
+            else:
+                targets = [
+                    stream
+                    for sid, streams in self._streams.items()
+                    if self._may_use(sid, server)
+                    for stream in streams
+                ]
+        for stream in targets:
+            stream.put(msg)
 
     def authenticate(self, header: str | None) -> tuple[bool, ClientSpec | None]:
         """(ok, client) for an Authorization header; client is None when auth is off."""
@@ -170,6 +244,11 @@ class GatewayServer:
     def handle(
         self, msg: Any, session: str, remote: str, client: ClientSpec | None = None
     ) -> Message | None:
+        return self.submit(msg, session, remote, client).result(self.request_timeout)
+
+    def submit(
+        self, msg: Any, session: str, remote: str, client: ClientSpec | None = None
+    ) -> Future[Message | None]:
         context: dict[str, Any] = {"session": session[:8], "remote": remote}
         if client is not None and client.name:
             context["user"] = client.name
@@ -182,11 +261,18 @@ class GatewayServer:
             finally:
                 AUDIT_CONTEXT.reset(token)
 
-        return self._run(run(), timeout=self.request_timeout)  # type: ignore[no-any-return]
+        return asyncio.run_coroutine_threadsafe(run(), self._loop)
 
 
 def _is_request(msg: Any) -> bool:
     return isinstance(msg, dict) and "method" in msg and "id" in msg
+
+
+def _progress_token(msg: Message) -> Any:
+    if msg.get("method") != "tools/call" or "id" not in msg:
+        return None
+    meta = (msg.get("params") or {}).get("_meta")
+    return meta.get("progressToken") if isinstance(meta, dict) else None
 
 
 def _rpc_error(code: int, message: str, msg_id: Any = None) -> Message:
@@ -231,13 +317,68 @@ class _Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _accepts_sse(self) -> bool:
+        return "text/event-stream" in self.headers.get("Accept", "")
+
+    def _session(self) -> str | None:
+        """The request's session id, or None after answering 400/404."""
+        sid = self.headers.get(SESSION_HEADER, "")
+        if not sid:
+            self._send(400, _rpc_error(-32600, f"missing {SESSION_HEADER} header"))
+            return None
+        if not self.owner.has_session(sid, self.client):
+            self._send(404, _rpc_error(-32001, "session not found"))
+            return None
+        return sid
+
+    def _sse_start(self, headers: dict[str, str] | None = None) -> None:
+        # No Content-Length: the stream ends when the connection closes.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.close_connection = True
+
+    def _sse(self, msg: Any) -> None:
+        data = json.dumps(msg, ensure_ascii=False)
+        self.wfile.write(f"event: message\ndata: {data}\n\n".encode())
+        self.wfile.flush()
+
+    def _keepalive(self) -> None:
+        self.wfile.write(b": keep-alive\n\n")
+        self.wfile.flush()
+
     def do_GET(self) -> None:
         if urlsplit(self.path).path == "/healthz":
             self._send(200, {"status": "ok"})
-        elif self._guard():
-            self._send(
-                405, _rpc_error(-32600, "no server-initiated stream"), {"Allow": "POST, DELETE"}
-            )
+            return
+        if not self._guard():
+            return
+        if not self._accepts_sse():
+            self._send(405, _rpc_error(-32600, "GET needs Accept: text/event-stream"))
+            return
+        sid = self._session()
+        if sid is None:
+            return
+        stream = self.owner.open_stream(sid)
+        try:
+            self._sse_start()
+            while True:
+                try:
+                    msg = stream.get(timeout=KEEPALIVE)
+                except queue.Empty:
+                    self._keepalive()
+                    continue
+                if msg is None:
+                    break
+                self._sse(msg)
+        except OSError:
+            pass  # the client went away
+        finally:
+            self.owner.close_stream(sid, stream)
 
     def do_DELETE(self) -> None:
         if not self._guard():
@@ -272,13 +413,15 @@ class _Handler(BaseHTTPRequestHandler):
             sid = self.owner.new_session(self.client)
             headers[SESSION_HEADER] = sid
         else:
-            sid = self.headers.get(SESSION_HEADER, "")
-            if not sid:
-                self._send(400, _rpc_error(-32600, f"missing {SESSION_HEADER} header"))
+            found = self._session()
+            if found is None:
                 return
-            if not self.owner.has_session(sid, self.client):
-                self._send(404, _rpc_error(-32001, "session not found"))
-                return
+            sid = found
+
+        token = _progress_token(messages[0]) if not batch else None
+        if token is not None and self._accepts_sse():
+            self._stream_call(messages[0], sid, token)
+            return
 
         replies = []
         for msg in messages:
@@ -297,6 +440,40 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(202, headers=headers)
         else:
             self._send(200, replies if batch else replies[0], headers)
+
+    def _stream_call(self, msg: Message, sid: str, token: Any) -> None:
+        """Answer a tool call with its progress notifications, then its result."""
+        owner = self.owner
+        stream = owner.open_call_stream(sid, token)
+        future = owner.submit(msg, sid, self.client_address[0], self.client)
+        future.add_done_callback(lambda _: stream.put(_DONE))
+        deadline = time.monotonic() + owner.request_timeout
+        try:
+            self._sse_start()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    future.cancel()
+                    self._sse(_rpc_error(-32603, "mcp-warden: request timed out", msg["id"]))
+                    return
+                try:
+                    item = stream.get(timeout=min(KEEPALIVE, remaining))
+                except queue.Empty:
+                    self._keepalive()
+                    continue
+                if item is _DONE:
+                    break
+                self._sse(item)
+            try:
+                reply = future.result()
+            except Exception as exc:
+                log.exception("request failed")
+                reply = _rpc_error(-32603, f"mcp-warden internal error: {exc}", msg["id"])
+            self._sse(reply)
+        except OSError:
+            pass  # the client went away; the call still finishes and is audited
+        finally:
+            owner.close_call_stream(sid, token)
 
 
 def run_server(server: GatewayServer) -> int:
