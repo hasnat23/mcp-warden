@@ -168,3 +168,25 @@ def test_gateway_survives_a_dead_server(tmp_path):
         "ok__read_file",
     ]
     assert replies[2]["error"]["code"] == -32000
+
+
+def test_gateway_passes_progress_with_the_clients_token(tmp_path):
+    cfg = write_config(
+        tmp_path,
+        "servers:\n"
+        f"  ok:\n    command: [{json.dumps(sys.executable)}, {json.dumps(str(FAKE_SERVER))}]\n",
+    )
+    msg = call(1, "ok__read_file", path="a")
+    msg["params"]["_meta"] = {"progressToken": 7}
+    proc = subprocess.run(
+        [*WARDEN, "run", "--config", str(cfg)],
+        input="".join(json.dumps(m) + "\n" for m in [*INIT, msg]),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    out = [json.loads(line) for line in proc.stdout.splitlines()]
+    progress = [m for m in out if m.get("method") == "notifications/progress"]
+    assert [p["params"]["progressToken"] for p in progress] == [7, 7]
+    assert "ghp_" not in proc.stdout
+    assert out[-1]["id"] == 1
