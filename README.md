@@ -301,6 +301,17 @@ mcp-warden serve --config servers.yaml --host 0.0.0.0 --port 8765 --token-env WA
   ```
 
   Sessions are bound to the client that opened them, so one caller's session id is useless with another caller's token. Each record and span then also names the `user` (`enduser.id`).
+- People can sign in with your identity provider instead (Keycloak, Entra ID, Okta, Auth0, Google...), following the MCP authorization spec. `serve` acts as an OAuth 2.1 resource server: it publishes Protected Resource Metadata (RFC 9728) pointing clients at your issuer, and checks every JWT access token's signature against the issuer's keys, its issuer, audience (this server's URL), expiry and scopes. Install the extra with `pip install 'mcp-warden[oauth]'`:
+
+  ```yaml
+  oauth:
+    issuer: https://login.example.com/realms/acme
+    audience: https://warden.example.com/mcp   # this server's public URL
+    scopes: [mcp]                              # required in every token
+    user_claim: email                          # recorded as `user` (default: sub)
+  ```
+
+  Unauthenticated requests get `401` with `WWW-Authenticate: Bearer resource_metadata="..."`, so MCP clients can start the sign-in flow on their own; a token without the scopes gets `403 insufficient_scope`. Static `clients` tokens keep working next to OAuth, which suits CI jobs and bots.
 - Browser requests are rejected unless their `Origin` is localhost or listed with `--allow-origin`, which blocks DNS rebinding.
 - Every audit record and span carries the caller's `remote` address and a short `session` id.
 - Upstreams start and their tools are listed once before the port opens, so a poisoned or drifted tool is hidden even from a client that calls it without listing first.
@@ -316,7 +327,7 @@ ruff check . && ruff format --check . && mypy
 
 ## Roadmap
 
-- OAuth 2.1 resource server mode for `serve`, so callers can sign in with an identity provider instead of static tokens
+- Pass resources and prompts through multi-server mode and `serve` (today they return empty lists), with the same scanning and redaction as tools
 
 ## License
 

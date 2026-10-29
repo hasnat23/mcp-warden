@@ -24,6 +24,10 @@ All notable changes to this project are documented here. The format follows
 - SSE streams in `serve`: tool calls with a progress token stream their progress before the
   result, and a `GET` stream carries `tools/list_changed` and log messages per client.
   Progress tokens are rewritten per call and progress messages are redacted.
+- OAuth 2.1 resource server mode for `serve` (`oauth:` in the servers file, extra
+  `mcp-warden[oauth]`): JWT access tokens are checked against the issuer's keys, issuer,
+  audience, expiry and scopes, Protected Resource Metadata (RFC 9728) is published, and the
+  user comes from a configurable claim.
 
 ### Fixed
 - Cancelled tool calls (`notifications/cancelled`) are audited and no longer leak pending

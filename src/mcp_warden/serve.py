@@ -37,6 +37,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from mcp_warden.gateway import Gateway, Message
+from mcp_warden.oauth import METADATA_PATH, InsufficientScope, InvalidToken, OAuthValidator
 from mcp_warden.servers import ClientSpec, ServerSpec, token_digest
 from mcp_warden.warden import AUDIT_CONTEXT, Sink
 
@@ -77,6 +78,7 @@ class GatewayServer:
         sinks: Sequence[Sink] = (),
         token: str | None = None,
         clients: Sequence[ClientSpec] = (),
+        oauth: OAuthValidator | None = None,
         allowed_origins: Sequence[str] = (),
         request_timeout: float = 300.0,
     ):
@@ -88,7 +90,8 @@ class GatewayServer:
         self.clients = list(clients)
         if token is not None:
             self.clients.append(ClientSpec("", token_digest(token)))
-        self.auth_required = bool(self.clients)
+        self.oauth = oauth
+        self.auth_required = bool(self.clients) or oauth is not None
         self.allowed_origins = list(allowed_origins)
         self.request_timeout = request_timeout
         # session id -> the client that opened it
@@ -227,19 +230,47 @@ class GatewayServer:
         for stream in targets:
             stream.put(msg)
 
-    def authenticate(self, header: str | None) -> tuple[bool, ClientSpec | None]:
-        """(ok, client) for an Authorization header; client is None when auth is off."""
+    def challenge(self, error: str | None = None, scope: str | None = None) -> str:
+        """A WWW-Authenticate value; with OAuth it points clients at our metadata."""
+        params = []
+        if self.oauth is not None:
+            params.append(f'resource_metadata="{self.oauth.config.metadata_url()}"')
+        if error:
+            params.append(f'error="{error}"')
+        if scope:
+            params.append(f'scope="{scope}"')
+        return "Bearer " + ", ".join(params) if params else "Bearer"
+
+    def authenticate(self, header: str | None) -> ClientSpec | None:
+        """The caller behind an Authorization header (None when auth is off).
+
+        Static client tokens are checked first, then OAuth access tokens.
+        Raises AuthError when the caller must not get in.
+        """
         if not self.auth_required:
-            return True, None
+            return None
         scheme, _, value = (header or "").partition(" ")
-        if scheme.lower() != "bearer" or not value.strip():
-            return False, None
-        digest = token_digest(value.strip()).encode()
+        token = value.strip()
+        if scheme.lower() != "bearer" or not token:
+            raise AuthError(401, self.challenge())
+        digest = token_digest(token).encode()
         found = None
         for client in self.clients:  # compare against every client, in constant time
             if hmac.compare_digest(digest, client.token_sha256.encode()):
                 found = client
-        return found is not None, found
+        if found is not None:
+            return found
+        if self.oauth is None:
+            raise AuthError(401, self.challenge("invalid_token"))
+        try:
+            user = self.oauth.validate(token)
+        except InsufficientScope as exc:
+            scope = " ".join(exc.required)
+            raise AuthError(403, self.challenge("insufficient_scope", scope)) from None
+        except InvalidToken as exc:
+            log.info("rejected access token: %s", exc)
+            raise AuthError(401, self.challenge("invalid_token")) from None
+        return ClientSpec(user, "")
 
     def handle(
         self, msg: Any, session: str, remote: str, client: ClientSpec | None = None
@@ -262,6 +293,13 @@ class GatewayServer:
                 AUDIT_CONTEXT.reset(token)
 
         return asyncio.run_coroutine_threadsafe(run(), self._loop)
+
+
+class AuthError(Exception):
+    def __init__(self, status: int, challenge: str):
+        super().__init__(challenge)
+        self.status = status
+        self.challenge = challenge
 
 
 def _is_request(msg: Any) -> bool:
@@ -311,9 +349,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not origin_allowed(self.headers.get("Origin"), self.owner.allowed_origins):
             self._send(403, _rpc_error(-32600, "origin not allowed"))
             return False
-        ok, self.client = self.owner.authenticate(self.headers.get("Authorization"))
-        if not ok:
-            self._send(401, _rpc_error(-32600, "unauthorized"), {"WWW-Authenticate": "Bearer"})
+        try:
+            self.client = self.owner.authenticate(self.headers.get("Authorization"))
+        except AuthError as exc:
+            message = "insufficient scope" if exc.status == 403 else "unauthorized"
+            self._send(exc.status, _rpc_error(-32600, message), {"WWW-Authenticate": exc.challenge})
             return False
         return True
 
@@ -352,7 +392,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def do_GET(self) -> None:
-        if urlsplit(self.path).path == "/healthz":
+        path = urlsplit(self.path).path
+        if path.startswith(METADATA_PATH) and self.owner.oauth is not None:
+            self._send(200, self.owner.oauth.config.metadata())
+            return
+        if path == "/healthz":
             self._send(200, {"status": "ok"})
             return
         if not self._guard():
