@@ -169,16 +169,27 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if not token:
             print(f"mcp-warden serve: ${args.token_env} is empty or unset", file=sys.stderr)
             return 2
-    from mcp_warden.servers import load_clients
+    from mcp_warden.servers import load_clients, load_oauth
 
     specs = _load_specs(args)
     clients = load_clients(args.config, specs)
-    if clients and token:
+    oauth_config = load_oauth(args.config)
+    if (clients or oauth_config) and token:
         print(
-            "mcp-warden serve: --token-env cannot be combined with 'clients' in --config",
+            "mcp-warden serve: --token-env cannot be combined with 'clients' or 'oauth' "
+            "in --config",
             file=sys.stderr,
         )
         return 2
+    oauth = None
+    if oauth_config is not None:
+        from mcp_warden.oauth import OAuthUnavailable, OAuthValidator
+
+        try:
+            oauth = OAuthValidator(oauth_config)
+        except OAuthUnavailable as exc:
+            print(f"mcp-warden: {exc}", file=sys.stderr)
+            return 2
     _apply_overrides(args, [s.policy for s in specs])
     sinks = _sinks([s.policy for s in specs])
     if sinks is None:
@@ -191,6 +202,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         sinks=sinks,
         token=token,
         clients=clients,
+        oauth=oauth,
         allowed_origins=args.allow_origin or [],
     )
     return run_server(server)

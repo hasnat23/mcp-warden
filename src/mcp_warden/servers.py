@@ -9,6 +9,7 @@ import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -150,3 +151,45 @@ def load_clients(path: str | Path, servers: list[ServerSpec]) -> list[ClientSpec
             raise PolicyError(f"clients.{name}: token is shared with another client")
         clients.append(ClientSpec(name, digest, allowed))
     return clients
+
+
+def load_oauth(path: str | Path) -> Any:
+    """Parse the optional ``oauth`` section, used by ``serve``::
+
+    oauth:
+      issuer: https://login.example.com/realms/acme
+      audience: https://warden.example.com/mcp   # this server's public URL
+      scopes: [mcp]                              # required in every token
+      user_claim: email                          # who the caller is (default: sub)
+    """
+    from mcp_warden.oauth import OAuthConfig
+
+    p = Path(path)
+    data: Any = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    raw = data.get("oauth") if isinstance(data, dict) else None
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise PolicyError(f"{p}: 'oauth' must be a mapping")
+    values = {k: os.path.expandvars(str(raw[k])) for k in ("issuer", "audience") if raw.get(k)}
+    for key in ("issuer", "audience"):
+        if key not in values:
+            raise PolicyError(f"oauth.{key} is required")
+    jwks_uri = os.path.expandvars(str(raw["jwks_uri"])) if raw.get("jwks_uri") else None
+    for key, url in [*values.items(), ("jwks_uri", jwks_uri)]:
+        if url is None:
+            continue
+        parts = urlsplit(url)
+        local = parts.hostname in ("localhost", "127.0.0.1", "::1")
+        if parts.scheme != "https" and not (parts.scheme == "http" and local):
+            raise PolicyError(f"oauth.{key} must be an https URL, got {url!r}")
+    scopes = raw.get("scopes") or []
+    if not isinstance(scopes, list):
+        raise PolicyError("oauth.scopes must be a list")
+    return OAuthConfig(
+        issuer=values["issuer"],
+        audience=values["audience"],
+        scopes=[str(s) for s in scopes],
+        user_claim=str(raw.get("user_claim") or "sub"),
+        jwks_uri=jwks_uri,
+    )
