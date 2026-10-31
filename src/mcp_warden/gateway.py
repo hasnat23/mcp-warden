@@ -1,10 +1,11 @@
 """Multi-server gateway: one stdio MCP endpoint in front of several servers.
 
-The client sees a single server whose tools are named ``<server>__<tool>``.
-Each upstream server gets its own ``Warden`` (and so its own policy, lockfile
-and rate limits), and every audit record carries the server it came from.
-Upstreams are either child processes speaking stdio or Streamable HTTP
-endpoints.
+The client sees a single server whose tools and prompts are named
+``<server>__<name>``. Resources keep their URIs; reads are routed to the server
+that listed the URI or whose template matches it. Each upstream server gets its
+own ``Warden`` (and so its own policy, lockfile and rate limits), and every audit
+record carries the server it came from. Upstreams are either child processes
+speaking stdio or Streamable HTTP endpoints.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import contextlib
 import itertools
 import logging
 import os
+import re
 import sys
 from collections.abc import Callable, Collection, Sequence
 from typing import Any, BinaryIO
@@ -38,8 +40,27 @@ CLIENT_INFO = {"name": "mcp-warden", "version": __version__}
 Deliver = Callable[[Message, "str | None", str], None]
 
 
+LIST_CHANGED = (
+    "notifications/tools/list_changed",
+    "notifications/resources/list_changed",
+    "notifications/prompts/list_changed",
+)
+
+
 class UpstreamError(RuntimeError):
     pass
+
+
+def template_regex(template: str) -> re.Pattern[str]:
+    """A regex for the URIs an RFC 6570 template can expand to (loosely)."""
+    out = []
+    for part in re.split(r"(\{[^}]*\})", template):
+        if part.startswith("{") and part.endswith("}"):
+            op = part[1:2]
+            out.append(".+" if op in ("+", "#") else ".*" if op in ("?", "&") else "[^/?#]+")
+        else:
+            out.append(re.escape(part))
+    return re.compile("".join(out))
 
 
 def _error(msg_id: Any, code: int, message: str) -> Message:
@@ -53,6 +74,7 @@ class Upstream:
         self.name = name
         self._on_notify = on_notify
         self._ids = itertools.count(1)
+        self.capabilities: dict[str, Any] = {}
 
     def next_id(self) -> int:
         return next(self._ids)
@@ -82,6 +104,9 @@ class Upstream:
         )
         if "error" in reply:
             raise UpstreamError(f"{self.name}: initialize failed: {reply['error']}")
+        result = reply.get("result")
+        caps = result.get("capabilities") if isinstance(result, dict) else None
+        self.capabilities = caps if isinstance(caps, dict) else {}
         await self.notify({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     def _incoming(self, msg: Any) -> Message | None:
@@ -234,6 +259,9 @@ class Gateway:
         # may pick the same ones: gateway token -> (client scope, client's token).
         self._progress: dict[str, tuple[str, Any]] = {}
         self._progress_ids = itertools.count(1)
+        # What each server last listed, for routing resources/read by URI.
+        self._resource_uris: dict[str, set[str]] = {}
+        self._templates: dict[str, list[re.Pattern[str]]] = {}
         self._audits: dict[str | None, AuditLog] = {}
         self.wardens: dict[str, Warden] = {}
         self.upstreams: dict[str, Upstream] = {}
@@ -296,7 +324,7 @@ class Gateway:
 
     def _route_notification(self, server: str, msg: Message) -> None:
         method = msg.get("method")
-        if method == "notifications/tools/list_changed":
+        if method in LIST_CHANGED:
             self.deliver({"jsonrpc": "2.0", "method": method}, None, server)
             return
         if method not in ("notifications/progress", "notifications/message"):
@@ -342,7 +370,7 @@ class Gateway:
                 "id": msg_id,
                 "result": {
                     "protocolVersion": version if isinstance(version, str) else PROTOCOL_VERSION,
-                    "capabilities": {"tools": {"listChanged": self.notifies}},
+                    "capabilities": self._capabilities(),
                     "serverInfo": CLIENT_INFO,
                 },
             }
@@ -353,11 +381,137 @@ class Gateway:
             return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": tools}}
         if method == "tools/call":
             return await self._call_tool(msg_id, params, scope, allowed)
-        empty = {"resources/list": "resources", "resources/templates/list": "resourceTemplates"}
-        if method in empty or method == "prompts/list":
-            key = empty.get(method, "prompts")
-            return {"jsonrpc": "2.0", "id": msg_id, "result": {key: []}}
+        if method == "resources/list":
+            resources = await self.list_resources(allowed)
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {"resources": resources}}
+        if method == "resources/templates/list":
+            templates = await self.list_resource_templates(allowed)
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {"resourceTemplates": templates}}
+        if method == "resources/read":
+            return await self._read_resource(msg_id, params, allowed)
+        if method == "prompts/list":
+            prompts = await self.list_prompts(allowed)
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {"prompts": prompts}}
+        if method == "prompts/get":
+            return await self._get_prompt(msg_id, params, allowed)
         return _error(msg_id, -32601, f"method not found: {method}")
+
+    def _capabilities(self) -> Message:
+        caps: Message = {"tools": {"listChanged": self.notifies}}
+        for feature in ("resources", "prompts"):
+            if any(feature in u.capabilities for u in self.upstreams.values()):
+                caps[feature] = {"listChanged": self.notifies}
+        return caps
+
+    def _serving(self, allowed: Collection[str] | None, feature: str) -> list[str]:
+        """Servers, in config order, that the client may use and that offer ``feature``."""
+        return [
+            name
+            for name, upstream in self.upstreams.items()
+            if (allowed is None or name in allowed) and feature in upstream.capabilities
+        ]
+
+    async def _paginate(self, name: str, method: str, key: str) -> list[Message]:
+        upstream, cursor = self.upstreams[name], None
+        items: list[Message] = []
+        try:
+            while True:
+                reply = await upstream.call(method, {"cursor": cursor} if cursor else None)
+                result = reply.get("result")
+                if not isinstance(result, dict):
+                    log.error("%s: %s failed: %s", name, method, reply.get("error"))
+                    break
+                items.extend(i for i in result.get(key) or [] if isinstance(i, dict))
+                cursor = result.get("nextCursor")
+                if not cursor:
+                    break
+        except UpstreamError as exc:
+            log.error("%s", exc)
+        return items
+
+    async def list_resources(self, allowed: Collection[str] | None = None) -> list[Message]:
+        names = self._serving(allowed, "resources")
+        lists = await asyncio.gather(
+            *(self._paginate(n, "resources/list", "resources") for n in names)
+        )
+        resources, seen = [], set()
+        for name, items in zip(names, lists, strict=True):
+            uris = {str(r["uri"]) for r in items if isinstance(r.get("uri"), str)}
+            self._resource_uris[name] = uris
+            for r in items:
+                uri = r.get("uri")
+                if uri in seen:
+                    log.warning("%s: resource %s is also listed by an earlier server", name, uri)
+                    continue
+                seen.add(uri)
+                resources.append(r)
+        return resources
+
+    async def list_resource_templates(
+        self, allowed: Collection[str] | None = None
+    ) -> list[Message]:
+        names = self._serving(allowed, "resources")
+        method, key = "resources/templates/list", "resourceTemplates"
+        lists = await asyncio.gather(*(self._paginate(n, method, key) for n in names))
+        templates = []
+        for name, items in zip(names, lists, strict=True):
+            self._templates[name] = [
+                template_regex(str(t["uriTemplate"]))
+                for t in items
+                if isinstance(t.get("uriTemplate"), str)
+            ]
+            templates.extend(items)
+        return templates
+
+    async def _read_resource(
+        self, client_id: Any, params: Message, allowed: Collection[str] | None
+    ) -> Message:
+        uri = params.get("uri")
+        if not isinstance(uri, str):
+            return _error(client_id, -32602, "resources/read needs a uri")
+        candidates = self._serving(allowed, "resources")
+        owners = (
+            [n for n in candidates if uri in self._resource_uris.get(n, ())]
+            or [n for n in candidates if any(t.fullmatch(uri) for t in self._templates.get(n, ()))]
+            or candidates  # not listed yet: ask each server in turn
+        )
+        reply: Message = _error(client_id, -32002, f"resource not found: {uri}")
+        for name in owners:
+            try:
+                answer = await self.upstreams[name].call("resources/read", {"uri": uri})
+            except UpstreamError as exc:
+                reply = _error(client_id, -32000, f"mcp-warden upstream error: {exc}")
+                continue
+            if "result" in answer:
+                result = self.wardens[name].filter_resource(uri, answer["result"])
+                return {"jsonrpc": "2.0", "id": client_id, "result": result}
+            reply = {**answer, "id": client_id}
+        return reply
+
+    async def list_prompts(self, allowed: Collection[str] | None = None) -> list[Message]:
+        names = self._serving(allowed, "prompts")
+        lists = await asyncio.gather(*(self._paginate(n, "prompts/list", "prompts") for n in names))
+        return [
+            {**p, "name": f"{name}{SEP}{p.get('name')}"}
+            for name, items in zip(names, lists, strict=True)
+            for p in items
+        ]
+
+    async def _get_prompt(
+        self, client_id: Any, params: Message, allowed: Collection[str] | None
+    ) -> Message:
+        full = str(params.get("name", ""))
+        server, sep, prompt = full.partition(SEP)
+        if not sep or server not in self._serving(allowed, "prompts"):
+            return _error(client_id, -32602, f"unknown prompt: {full}")
+        try:
+            answer = await self.upstreams[server].call("prompts/get", {**params, "name": prompt})
+        except UpstreamError as exc:
+            return _error(client_id, -32000, f"mcp-warden upstream error: {exc}")
+        if "result" not in answer:
+            return {**answer, "id": client_id}
+        result = self.wardens[server].filter_prompt(prompt, answer["result"])
+        return {"jsonrpc": "2.0", "id": client_id, "result": result}
 
     async def list_tools(self, allowed: Collection[str] | None = None) -> list[Message]:
         names = [n for n in self.upstreams if allowed is None or n in allowed]
