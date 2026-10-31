@@ -269,6 +269,8 @@ servers:
 { "mcpServers": { "warden": { "command": "mcp-warden", "args": ["run", "--config", "servers.yaml"] } } }
 ```
 
+Prompts are exposed as `<server>__<prompt>` too. Resources keep their URIs, and `resources/read` goes to the server that listed the URI or whose URI template matches it (or to each server in turn, for a URI nobody has listed yet). Resource contents and prompt messages get the same treatment as tool results: secrets are redacted and the text is scanned for injected instructions, withheld when `scan.results` is `block`, and recorded as `resource_read` and `prompt_get` audit events.
+
 Each audit record and span gets a `server` field (`mcp_warden.server`), so `jq 'select(.server == "tracker")'` filters one upstream. Lockfiles are split per server (`warden.lock.fs.json`, ...) because pins are keyed by tool name. `${VAR}` is expanded in commands, URLs and headers, so tokens stay out of the file. A server that fails to start is logged and left out of the tool list instead of taking the others down. `--monitor`, `--audit`, `--lockfile` and `--otel` apply to every server.
 
 ## Shared HTTP gateway
@@ -327,7 +329,8 @@ ruff check . && ruff format --check . && mypy
 
 ## Roadmap
 
-- Pass resources and prompts through multi-server mode and `serve` (today they return empty lists), with the same scanning and redaction as tools
+- Allow and deny rules for resources by URI pattern, like the tool rules
+- Resource subscriptions (`resources/subscribe`) through the gateway
 
 ## License
 

@@ -23,7 +23,7 @@ from mcp_warden.pinning import Lockfile, tool_fingerprint
 from mcp_warden.policy import Policy
 from mcp_warden.ratelimit import RateLimiter
 from mcp_warden.redact import Redactor
-from mcp_warden.scanner import scan_result, scan_tools
+from mcp_warden.scanner import scan_result, scan_text, scan_tools
 
 log = logging.getLogger("mcp_warden")
 
@@ -263,6 +263,74 @@ class Warden:
             else None,
         )
         return out
+
+    # ------------------------------------------------------------------ resources and prompts
+
+    def filter_resource(self, uri: str, result: Any) -> Any:
+        """Redact and scan a ``resources/read`` result, which goes straight to the model."""
+
+        def blocks(r: Any) -> list[tuple[str, Any]]:
+            items = r.get("contents") or [] if isinstance(r, dict) else []
+            return [(f"contents[{i}]", b) for i, b in enumerate(items) if isinstance(b, dict)]
+
+        out, record = self._screen(result, blocks)
+        if record["blocked"]:
+            text = f"Blocked by mcp-warden: {record['reason']}"
+            out = {"contents": [{"uri": uri, "mimeType": "text/plain", "text": text}]}
+        self._emit("resource_read", uri=uri, **record)
+        return out
+
+    def filter_prompt(self, name: str, result: Any) -> Any:
+        """Redact and scan a ``prompts/get`` result before it enters the conversation."""
+
+        def blocks(r: Any) -> list[tuple[str, Any]]:
+            items = r.get("messages") or [] if isinstance(r, dict) else []
+            return [
+                (f"messages[{i}]", m["content"])
+                for i, m in enumerate(items)
+                if isinstance(m, dict) and isinstance(m.get("content"), dict)
+            ]
+
+        out, record = self._screen(result, blocks)
+        if record["blocked"]:
+            text = f"Blocked by mcp-warden: {record['reason']}"
+            out = {"messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
+        self._emit("prompt_get", prompt=name, **record)
+        return out
+
+    def _screen(
+        self, result: Any, blocks: Callable[[Any], list[tuple[str, Any]]]
+    ) -> tuple[Any, dict[str, Any]]:
+        """Redact a result, then scan the text of the blocks it yields for injections."""
+        out, redactions = copy.deepcopy(result), 0
+        if self.policy.redact:
+            out, redactions = self.redactor.redact(out)
+            if redactions:
+                log.warning("redacted %d secret(s)", redactions)
+        findings: list[Finding] = []
+        if self.policy.scan_results != "off":
+            for location, block in blocks(out):
+                if isinstance(block.get("text"), str):
+                    findings.extend(scan_text(block["text"], location=location))
+            self.findings.extend(findings)
+        blocked = (
+            self.policy.scan_results == "block"
+            and self.policy.enforcing
+            and any(f.severity >= self.policy.block_severity for f in findings)
+        )
+        reason = None
+        if blocked:
+            worst = max(findings, key=lambda f: f.severity)
+            reason = f"content withheld, possible prompt injection ({worst.rule} {worst.message})"
+        for f in findings:
+            log.warning("[%s] %s at %s: %s", f.severity, f.rule, f.location, f.message)
+        record = {
+            "redactions": redactions,
+            "findings": [f.to_dict() for f in findings],
+            "blocked": blocked,
+            "reason": reason,
+        }
+        return out, record
 
     # ------------------------------------------------------------------ helpers
 

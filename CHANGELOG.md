@@ -28,6 +28,9 @@ All notable changes to this project are documented here. The format follows
   `mcp-warden[oauth]`): JWT access tokens are checked against the issuer's keys, issuer,
   audience, expiry and scopes, Protected Resource Metadata (RFC 9728) is published, and the
   user comes from a configurable claim.
+- Resources and prompts in multi-server mode and `serve`: prompts are prefixed like tools,
+  resource reads are routed by listed URI or URI template, and resource contents and prompt
+  messages are redacted, scanned for injections and audited (`resource_read`, `prompt_get`).
 
 ### Fixed
 - Cancelled tool calls (`notifications/cancelled`) are audited and no longer leak pending
