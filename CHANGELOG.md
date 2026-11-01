@@ -31,8 +31,14 @@ All notable changes to this project are documented here. The format follows
 - Resources and prompts in multi-server mode and `serve`: prompts are prefixed like tools,
   resource reads are routed by listed URI or URI template, and resource contents and prompt
   messages are redacted, scanned for injections and audited (`resource_read`, `prompt_get`).
+- `resources:` and `prompts:` allow and deny lists in the policy, globs on the URI and the
+  prompt name. Denied items are hidden from listings and blocked before reaching the server,
+  in single-server and multi-server mode; `resource_read` and `prompt_get` records carry a
+  `decision`.
 
 ### Fixed
+- The single-server proxy now scans `resources/read` and `prompts/get` results for injected
+  instructions like tool results, instead of only redacting them.
 - Cancelled tool calls (`notifications/cancelled`) are audited and no longer leak pending
   state; responses with an untracked id are still redacted (#3, #4).
 - Transport and server errors in the CLI print a one-line message instead of a traceback (#5).

@@ -61,6 +61,22 @@ def blocked_result(reason: str) -> dict[str, Any]:
     }
 
 
+def blocked_resource(uri: str, reason: str) -> dict[str, Any]:
+    """A ``resources/read`` result standing in for content that was withheld."""
+    text = f"Blocked by mcp-warden: {reason}"
+    return {"contents": [{"uri": uri, "mimeType": "text/plain", "text": text}]}
+
+
+def blocked_prompt(reason: str) -> dict[str, Any]:
+    """A ``prompts/get`` result standing in for a prompt that was withheld."""
+    text = f"Blocked by mcp-warden: {reason}"
+    return {"messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
+
+
+# Requests whose responses the warden inspects in single-server mode.
+_TRACKED = ("tools/list", "resources/list", "prompts/list")
+
+
 class Warden:
     def __init__(
         self,
@@ -99,7 +115,19 @@ class Warden:
         method = msg["method"]
         if method == "tools/call":
             return self._on_tool_call(msg)
-        if method == "tools/list":
+        raw = msg.get("params")
+        params: dict[str, Any] = raw if isinstance(raw, dict) else {}
+        if method in ("resources/read", "prompts/get"):
+            if method == "resources/read":
+                target = str(params.get("uri", ""))
+                blocked = self.admit_resource(target)
+            else:
+                target = str(params.get("name", ""))
+                blocked = self.admit_prompt(target)
+            if blocked is not None:
+                return Outcome(to_client=[{"jsonrpc": "2.0", "id": msg["id"], "result": blocked}])
+            self._pending[_id_key(msg["id"])] = _Pending(method, self._clock(), target)
+        elif method in _TRACKED:
             self._pending[_id_key(msg["id"])] = _Pending(method, self._clock())
         return Outcome(to_server=[msg])
 
@@ -152,7 +180,19 @@ class Warden:
             return Outcome(to_client=[self._on_tools_list(msg)])
         if pending.method == "tools/call":
             return Outcome(to_client=[self._on_tool_result(msg, pending)])
-        return Outcome(to_client=[msg])
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            return Outcome(to_client=[msg])
+        target = pending.tool or ""
+        if pending.method == "resources/read":
+            result = self.filter_resource(target, result)
+        elif pending.method == "prompts/get":
+            result = self.filter_prompt(target, result)
+        elif pending.method == "resources/list":
+            result = {**result, "resources": self.visible_resources(result.get("resources"))}
+        elif pending.method == "prompts/list":
+            result = {**result, "prompts": self.visible_prompts(result.get("prompts"))}
+        return Outcome(to_client=[{**msg, "result": result}])
 
     def _redact_unmatched(self, msg: Message) -> Message:
         """Responses we are not tracking (e.g. arriving after a cancel) still get redacted."""
@@ -266,6 +306,44 @@ class Warden:
 
     # ------------------------------------------------------------------ resources and prompts
 
+    def admit_resource(self, uri: str) -> dict[str, Any] | None:
+        """Check a ``resources/read`` against the policy before it reaches the server.
+
+        Returns None to forward the read, or the result to answer with instead.
+        """
+        reason = self.policy.resource_allowed(uri)
+        if reason is None:
+            return None
+        self._deny("resource_read", reason, uri=uri)
+        return blocked_resource(uri, reason) if self.policy.enforcing else None
+
+    def admit_prompt(self, name: str) -> dict[str, Any] | None:
+        """Check a ``prompts/get`` against the policy, like :meth:`admit_resource`."""
+        reason = self.policy.prompt_allowed(name)
+        if reason is None:
+            return None
+        self._deny("prompt_get", reason, prompt=name)
+        return blocked_prompt(reason) if self.policy.enforcing else None
+
+    def visible_resources(self, items: Any) -> list[Any]:
+        """Drop listed resources the policy denies (only when enforcing)."""
+        return self._visible(items, "uri", self.policy.resource_allowed)
+
+    def visible_prompts(self, items: Any) -> list[Any]:
+        """Drop listed prompts the policy denies (only when enforcing)."""
+        return self._visible(items, "name", self.policy.prompt_allowed)
+
+    def _visible(self, items: Any, key: str, check: Callable[[str], str | None]) -> list[Any]:
+        listed: list[Any] = list(items) if isinstance(items, list) else []
+        if not self.policy.enforcing:
+            return listed
+        return [i for i in listed if not (isinstance(i, dict) and check(str(i.get(key, ""))))]
+
+    def _deny(self, event: str, reason: str, **fields: Any) -> None:
+        decision = "deny" if self.policy.enforcing else "would_deny"
+        log.warning("%s %s: %s", "denied" if self.policy.enforcing else "would deny", event, reason)
+        self._emit(event, decision=decision, reason=reason, **fields)
+
     def filter_resource(self, uri: str, result: Any) -> Any:
         """Redact and scan a ``resources/read`` result, which goes straight to the model."""
 
@@ -275,9 +353,8 @@ class Warden:
 
         out, record = self._screen(result, blocks)
         if record["blocked"]:
-            text = f"Blocked by mcp-warden: {record['reason']}"
-            out = {"contents": [{"uri": uri, "mimeType": "text/plain", "text": text}]}
-        self._emit("resource_read", uri=uri, **record)
+            out = blocked_resource(uri, record["reason"])
+        self._emit("resource_read", uri=uri, decision="allow", **record)
         return out
 
     def filter_prompt(self, name: str, result: Any) -> Any:
@@ -293,9 +370,8 @@ class Warden:
 
         out, record = self._screen(result, blocks)
         if record["blocked"]:
-            text = f"Blocked by mcp-warden: {record['reason']}"
-            out = {"messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
-        self._emit("prompt_get", prompt=name, **record)
+            out = blocked_prompt(record["reason"])
+        self._emit("prompt_get", prompt=name, decision="allow", **record)
         return out
 
     def _screen(

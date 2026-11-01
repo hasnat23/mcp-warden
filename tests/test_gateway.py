@@ -284,6 +284,51 @@ async def test_gateway_scopes_resources_and_prompts_per_client(tmp_path):
         await gateway.close()
 
 
+def test_gateway_applies_resource_and_prompt_rules_per_server(tmp_path):
+    cfg = resource_servers_config(tmp_path)
+    (tmp_path / "strict.yaml").write_text(
+        "resources: {deny: ['memo://b/secrets', 'memo://*/item/*']}\n"
+        "prompts: {deny: [review]}\n"
+        "audit: {path: audit.jsonl}\n"
+    )
+    messages = [
+        *INIT,
+        rpc_msg(1, "resources/list"),
+        rpc_msg(2, "prompts/list"),
+        rpc_msg(3, "resources/read", uri="memo://b/secrets"),
+        rpc_msg(4, "resources/read", uri="memo://b/item/7"),
+        rpc_msg(5, "resources/read", uri="memo://a/item/7"),
+        rpc_msg(6, "prompts/get", name="b__review"),
+    ]
+    proc = subprocess.run(
+        [*WARDEN, "run", "--config", str(cfg)],
+        input="".join(json.dumps(m) + "\n" for m in messages),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    replies = {r["id"]: r for r in map(json.loads, proc.stdout.splitlines()) if "id" in r}
+
+    uris = [r["uri"] for r in replies[1]["result"]["resources"]]
+    assert "memo://b/secrets" not in uris and "memo://b/notes" in uris
+    assert "memo://a/secrets" in uris  # rules belong to server b only
+    assert [p["name"] for p in replies[2]["result"]["prompts"]] == ["a__review"]
+
+    def text(i):
+        return replies[i]["result"]["contents"][0]["text"]
+
+    assert "deny rule" in text(3)
+    assert "deny rule" in text(4)
+    assert text(5) == "item 7"
+    assert "deny rule" in replies[6]["result"]["messages"][0]["content"]["text"]
+
+    records = [json.loads(x) for x in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    denied = [r for r in records if r.get("decision") == "deny"]
+    pairs = {(r["server"], r["event"]) for r in denied}
+    assert pairs == {("b", "resource_read"), ("b", "prompt_get")}
+    assert len(denied) == 3
+
+
 def test_template_regex():
     from mcp_warden.gateway import template_regex
 
