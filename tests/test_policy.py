@@ -17,6 +17,21 @@ def test_allow_and_deny_globs():
     assert "allow list" in p.tool_allowed("write_file")
 
 
+def test_resource_and_prompt_lists():
+    p = policy_from_dict(
+        {
+            "resources": {"allow": ["file:///workspace/*", "memo://*"], "deny": ["*/.env"]},
+            "prompts": {"deny": ["admin_*"]},
+        }
+    )
+    assert p.resource_allowed("file:///workspace/src/app.py") is None  # * spans slashes
+    assert "deny rule" in p.resource_allowed("file:///workspace/.env")
+    assert "allow list" in p.resource_allowed("file:///etc/passwd")
+    assert p.prompt_allowed("review") is None
+    assert "deny rule" in p.prompt_allowed("admin_reset")
+    assert p.tool_allowed("anything") is None
+
+
 def test_argument_rules_specific_and_any():
     p = policy_from_dict(
         {
@@ -58,6 +73,8 @@ def test_yaml_file_resolves_paths_relative_to_policy(tmp_path):
         {"arguments": [{"tool": "x"}]},
         {"arguments": [{"deny_pattern": "("}]},
         {"rate_limits": [{"max_calls": 0, "per_seconds": 1}]},
+        {"resources": ["file:///*"]},
+        {"prompts": {"deny": "review"}},
     ],
 )
 def test_invalid_policies(data):

@@ -43,6 +43,10 @@ class Policy:
     mode: Mode = "enforce"
     allow: list[str] = field(default_factory=list)
     deny: list[str] = field(default_factory=list)
+    resource_allow: list[str] = field(default_factory=list)
+    resource_deny: list[str] = field(default_factory=list)
+    prompt_allow: list[str] = field(default_factory=list)
+    prompt_deny: list[str] = field(default_factory=list)
     argument_rules: list[ArgumentRule] = field(default_factory=list)
     rate_limits: list[RateLimit] = field(default_factory=list)
     scan_descriptions: Action = "block"
@@ -63,12 +67,15 @@ class Policy:
 
     def tool_allowed(self, name: str) -> str | None:
         """Return a denial reason, or None if the tool name passes allow/deny lists."""
-        for pattern in self.deny:
-            if fnmatchcase(name, pattern):
-                return f"tool {name!r} matches deny rule {pattern!r}"
-        if self.allow and not any(fnmatchcase(name, p) for p in self.allow):
-            return f"tool {name!r} is not in the allow list"
-        return None
+        return _check_lists("tool", name, self.allow, self.deny)
+
+    def resource_allowed(self, uri: str) -> str | None:
+        """Return a denial reason, or None if the resource URI passes allow/deny lists."""
+        return _check_lists("resource", uri, self.resource_allow, self.resource_deny)
+
+    def prompt_allowed(self, name: str) -> str | None:
+        """Return a denial reason, or None if the prompt name passes allow/deny lists."""
+        return _check_lists("prompt", name, self.prompt_allow, self.prompt_deny)
 
     def check_arguments(self, name: str, arguments: dict[str, Any]) -> str | None:
         for rule in self.argument_rules:
@@ -83,6 +90,15 @@ class Policy:
                     why = rule.reason or f"matches {rule.pattern.pattern!r}"
                     return f"argument {key!r} of {name!r} denied: {why}"
         return None
+
+
+def _check_lists(kind: str, name: str, allow: list[str], deny: list[str]) -> str | None:
+    for pattern in deny:
+        if fnmatchcase(name, pattern):
+            return f"{kind} {name!r} matches deny rule {pattern!r}"
+    if allow and not any(fnmatchcase(name, p) for p in allow):
+        return f"{kind} {name!r} is not in the allow list"
+    return None
 
 
 def _walk_strings(value: Any, path: str = "") -> list[tuple[str, Any]]:
@@ -129,9 +145,19 @@ def policy_from_dict(data: dict[str, Any], base_dir: Path | None = None) -> Poli
     mode = data.get("mode", "enforce")
     _expect(mode in ("enforce", "monitor"), f"mode must be enforce|monitor, got {mode!r}")
 
-    tools = data.get("tools") or {}
-    allow = [str(p) for p in tools.get("allow") or []]
-    deny = [str(p) for p in tools.get("deny") or []]
+    def lists(key: str) -> tuple[list[str], list[str]]:
+        section = data.get(key) or {}
+        _expect(isinstance(section, dict), f"{key} must be a mapping with allow/deny lists")
+        out = []
+        for which in ("allow", "deny"):
+            patterns = section.get(which) or []
+            _expect(isinstance(patterns, list), f"{key}.{which} must be a list of patterns")
+            out.append([str(p) for p in patterns])
+        return out[0], out[1]
+
+    allow, deny = lists("tools")
+    resource_allow, resource_deny = lists("resources")
+    prompt_allow, prompt_deny = lists("prompts")
 
     arg_rules = []
     for i, raw in enumerate(data.get("arguments") or []):
@@ -168,6 +194,10 @@ def policy_from_dict(data: dict[str, Any], base_dir: Path | None = None) -> Poli
         mode=mode,
         allow=allow,
         deny=deny,
+        resource_allow=resource_allow,
+        resource_deny=resource_deny,
+        prompt_allow=prompt_allow,
+        prompt_deny=prompt_deny,
         argument_rules=arg_rules,
         rate_limits=limits,
         scan_descriptions=_action(scan.get("descriptions"), "scan.descriptions", "block"),

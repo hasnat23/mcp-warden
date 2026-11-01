@@ -438,7 +438,7 @@ class Gateway:
         for name, items in zip(names, lists, strict=True):
             uris = {str(r["uri"]) for r in items if isinstance(r.get("uri"), str)}
             self._resource_uris[name] = uris
-            for r in items:
+            for r in self.wardens[name].visible_resources(items):
                 uri = r.get("uri")
                 if uri in seen:
                     log.warning("%s: resource %s is also listed by an earlier server", name, uri)
@@ -477,6 +477,9 @@ class Gateway:
         )
         reply: Message = _error(client_id, -32002, f"resource not found: {uri}")
         for name in owners:
+            blocked = self.wardens[name].admit_resource(uri)
+            if blocked is not None:
+                return {"jsonrpc": "2.0", "id": client_id, "result": blocked}
             try:
                 answer = await self.upstreams[name].call("resources/read", {"uri": uri})
             except UpstreamError as exc:
@@ -494,7 +497,7 @@ class Gateway:
         return [
             {**p, "name": f"{name}{SEP}{p.get('name')}"}
             for name, items in zip(names, lists, strict=True)
-            for p in items
+            for p in self.wardens[name].visible_prompts(items)
         ]
 
     async def _get_prompt(
@@ -504,6 +507,9 @@ class Gateway:
         server, sep, prompt = full.partition(SEP)
         if not sep or server not in self._serving(allowed, "prompts"):
             return _error(client_id, -32602, f"unknown prompt: {full}")
+        blocked = self.wardens[server].admit_prompt(prompt)
+        if blocked is not None:
+            return {"jsonrpc": "2.0", "id": client_id, "result": blocked}
         try:
             answer = await self.upstreams[server].call("prompts/get", {**params, "name": prompt})
         except UpstreamError as exc:
