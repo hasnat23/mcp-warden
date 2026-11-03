@@ -35,6 +35,10 @@ All notable changes to this project are documented here. The format follows
   prompt name. Denied items are hidden from listings and blocked before reaching the server,
   in single-server and multi-server mode; `resource_read` and `prompt_get` records carry a
   `decision`.
+- Resource subscriptions through the gateway: `resources/subscribe` is routed to the server
+  that owns the URI, shared upstream between clients and released with the last one or when
+  a session ends, and `notifications/resources/updated` goes only to subscribed clients.
+  The policy's resource rules apply to subscriptions too.
 
 ### Fixed
 - The single-server proxy now scans `resources/read` and `prompts/get` results for injected

@@ -158,8 +158,11 @@ class GatewayServer:
         sid = secrets.token_urlsafe(24)
         with self._sessions_lock:
             self.sessions[sid] = client
+            evicted = []
             while len(self.sessions) > MAX_SESSIONS:
-                self.sessions.popitem(last=False)
+                evicted.append(self.sessions.popitem(last=False)[0])
+        for old in evicted:
+            self._forget(old)
         return sid
 
     def has_session(self, sid: str, client: ClientSpec | None) -> bool:
@@ -178,7 +181,13 @@ class GatewayServer:
         with self._streams_lock:
             for stream in self._streams.pop(sid, []):
                 stream.put(None)
+        self._forget(sid)
         return True
+
+    def _forget(self, sid: str) -> None:
+        """Release a finished session's resource subscriptions, without waiting."""
+        if self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.gateway.forget(sid), self._loop)
 
     # ------------------------------------------------------------------ streams
 

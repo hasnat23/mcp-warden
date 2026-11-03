@@ -281,6 +281,8 @@ Prompts are exposed as `<server>__<prompt>` too. Resources keep their URIs, and 
 
 The `resources` and `prompts` allow and deny lists work like the tool lists, in single-server and multi-server mode alike: denied resources and prompts are left out of listings, and reading or getting one returns a "Blocked by mcp-warden" message without the request reaching the server. In monitor mode both are only recorded, with `decision: would_deny`. URI templates stay listed, since a template can expand to allowed and denied URIs; the rules apply to each concrete URI read through them.
 
+Resource subscriptions work through the gateway too, when a server offers them. `resources/subscribe` goes to the server that owns the URI, and each URI is subscribed upstream once however many clients ask. `notifications/resources/updated` reaches only the clients subscribed to that URI, over the standing `GET` stream in `serve`. The upstream subscription is dropped when the last client unsubscribes or its session ends. Subscribing to a denied URI, or to one on a server the client may not use, answers "resource not found".
+
 Each audit record and span gets a `server` field (`mcp_warden.server`), so `jq 'select(.server == "tracker")'` filters one upstream. Lockfiles are split per server (`warden.lock.fs.json`, ...) because pins are keyed by tool name. `${VAR}` is expanded in commands, URLs and headers, so tokens stay out of the file. A server that fails to start is logged and left out of the tool list instead of taking the others down. `--monitor`, `--audit`, `--lockfile` and `--otel` apply to every server.
 
 ## Shared HTTP gateway
@@ -339,7 +341,7 @@ ruff check . && ruff format --check . && mypy
 
 ## Roadmap
 
-- Resource subscriptions (`resources/subscribe`) through the gateway
+- Forward server-to-client requests (sampling, elicitation, roots) through the gateway
 
 ## License
 

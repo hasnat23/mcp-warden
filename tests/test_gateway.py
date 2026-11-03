@@ -329,6 +329,65 @@ def test_gateway_applies_resource_and_prompt_rules_per_server(tmp_path):
     assert len(denied) == 3
 
 
+async def test_gateway_resource_subscriptions(tmp_path):
+    import asyncio
+
+    from mcp_warden.gateway import Gateway
+
+    cfg = resource_servers_config(tmp_path)
+    (tmp_path / "strict.yaml").write_text(
+        "resources: {deny: ['memo://b/secrets']}\naudit: {path: audit.jsonl}\n"
+    )
+    gateway = Gateway(load_servers(cfg))
+    got = []
+    gateway.deliver = lambda msg, scope, server: got.append((scope, server, msg["params"]))
+
+    async def touch(server):
+        await gateway.handle(call(99, f"{server}__touch"))
+        await asyncio.sleep(0.1)
+        updates = sorted((scope, params["uri"]) for scope, _, params in got)
+        got.clear()
+        return updates
+
+    def sub(scope, uri, method="resources/subscribe", allowed=None):
+        return gateway.handle(rpc_msg(1, method, uri=uri), scope, allowed)
+
+    try:
+        init = await gateway.handle({**INIT[0], "id": 0})
+        assert init["result"]["capabilities"]["resources"]["subscribe"] is True
+        await gateway.list_resources()
+
+        assert (await sub("s1", "memo://a/notes"))["result"] == {}
+        assert (await sub("s2", "memo://a/notes"))["result"] == {}
+        assert (await sub("s2", "memo://b/item/3"))["result"] == {}  # routed by template
+        assert await touch("a") == [("s1", "memo://a/notes"), ("s2", "memo://a/notes")]
+        assert await touch("b") == [("s2", "memo://b/item/3")]
+
+        # Update payloads are redacted like other notifications.
+        await gateway.handle(call(98, "a__touch"))
+        await asyncio.sleep(0.1)
+        assert "ghp_" not in json.dumps(got) and "REDACTED" in got[0][2]["title"]
+        got.clear()
+
+        # The upstream subscription stays until the last client lets go.
+        await sub("s1", "memo://a/notes", "resources/unsubscribe")
+        assert await touch("a") == [("s2", "memo://a/notes")]
+        await gateway.forget("s2")
+        assert await touch("a") == [] and await touch("b") == []
+
+        # Denied by policy, or on a server the client may not use: not found.
+        denied = await sub("s1", "memo://b/secrets")
+        assert denied["error"]["code"] == -32002
+        hidden = await sub("s1", "memo://b/notes", allowed={"a"})
+        assert hidden["error"]["code"] == -32002
+        assert await touch("b") == []
+    finally:
+        await gateway.close()
+    records = [json.loads(x) for x in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    subs = [r for r in records if r["event"] == "resource_subscribe"]
+    assert [(r["uri"], r["decision"]) for r in subs] == [("memo://b/secrets", "deny")]
+
+
 def test_template_regex():
     from mcp_warden.gateway import template_regex
 

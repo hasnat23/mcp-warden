@@ -2,8 +2,9 @@
 
 Tool definitions come from the JSON file given as the first argument ("-" for
 the default) or in $FAKE_TOOLS (default: two benign tools). With --resources NAME
-it also serves resources under memo://NAME/ and a prompt. Calling a tool returns
-canned text chosen by its name.
+it also serves resources under memo://NAME/ (subscribable; the "touch" tool reports
+an update to each subscribed URI) and a prompt. Calling a tool returns canned text
+chosen by its name.
 """
 
 import json
@@ -47,6 +48,7 @@ def send(msg):
 
 
 RESOURCE_TAG = sys.argv[sys.argv.index("--resources") + 1] if "--resources" in sys.argv else None
+SUBSCRIBED = set()
 
 
 def resource_text(path):
@@ -79,6 +81,12 @@ def resources_method(method, params):
         if text is None:
             return {"_error": {"code": -32002, "message": f"resource not found: {uri}"}}
         return {"contents": [{"uri": uri, "mimeType": "text/plain", "text": text}]}
+    if method == "resources/subscribe":
+        SUBSCRIBED.add(params.get("uri"))
+        return {"subscribed": sorted(SUBSCRIBED)}  # extra field, to make the state visible
+    if method == "resources/unsubscribe":
+        SUBSCRIBED.discard(params.get("uri"))
+        return {"subscribed": sorted(SUBSCRIBED)}
     if method == "prompts/list":
         return {"prompts": [{"name": "review", "arguments": [{"name": "code"}]}]}
     if method == "prompts/get":
@@ -102,7 +110,7 @@ def main():
                 "protocolVersion": "2025-06-18",
                 "capabilities": {
                     "tools": {},
-                    **({"resources": {}, "prompts": {}} if RESOURCE_TAG else {}),
+                    **({"resources": {"subscribe": True}, "prompts": {}} if RESOURCE_TAG else {}),
                 },
                 "serverInfo": {"name": "fake-server", "version": "1.0.0"},
             }
@@ -120,6 +128,11 @@ def main():
                     send({"jsonrpc": "2.0", "method": "notifications/progress", "params": progress})
             if name == "announce":
                 send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+            if name == "touch":  # report an update to every subscribed resource
+                for uri in sorted(SUBSCRIBED):
+                    params = {"uri": uri, "title": "token ghp_" + "d" * 36}
+                    method = "notifications/resources/updated"
+                    send({"jsonrpc": "2.0", "method": method, "params": params})
             text = RESPONSES.get(name, "ok").format(**args)
             result = {"content": [{"type": "text", "text": text}], "isError": False}
         elif RESOURCE_TAG and (result := resources_method(method, msg.get("params") or {})):
