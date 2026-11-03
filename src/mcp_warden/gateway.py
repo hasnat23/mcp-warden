@@ -40,6 +40,7 @@ CLIENT_INFO = {"name": "mcp-warden", "version": __version__}
 Deliver = Callable[[Message, "str | None", str], None]
 
 
+UPDATED = "notifications/resources/updated"
 LIST_CHANGED = (
     "notifications/tools/list_changed",
     "notifications/resources/list_changed",
@@ -262,6 +263,9 @@ class Gateway:
         # What each server last listed, for routing resources/read by URI.
         self._resource_uris: dict[str, set[str]] = {}
         self._templates: dict[str, list[re.Pattern[str]]] = {}
+        # Resource subscriptions: (server, uri) -> client scopes. Each URI is subscribed
+        # upstream once, however many clients want it, and dropped with the last one.
+        self._subscriptions: dict[tuple[str, str], set[str]] = {}
         self._audits: dict[str | None, AuditLog] = {}
         self.wardens: dict[str, Warden] = {}
         self.upstreams: dict[str, Upstream] = {}
@@ -327,13 +331,18 @@ class Gateway:
         if method in LIST_CHANGED:
             self.deliver({"jsonrpc": "2.0", "method": method}, None, server)
             return
-        if method not in ("notifications/progress", "notifications/message"):
+        if method not in ("notifications/progress", "notifications/message", UPDATED):
             return
         warden = self.wardens[server]
         if warden.policy.redact:
             msg = {**msg, "params": warden.redactor.redact(msg.get("params"))[0]}
         if method == "notifications/message":
             self.deliver(msg, None, server)
+            return
+        if method == UPDATED:
+            uri = str((msg.get("params") or {}).get("uri", ""))
+            for scope in sorted(self._subscriptions.get((server, uri), ())):
+                self.deliver(msg, scope, server)
             return
         params = msg.get("params") or {}
         target = self._progress.get(str(params.get("progressToken")))
@@ -389,6 +398,11 @@ class Gateway:
             return {"jsonrpc": "2.0", "id": msg_id, "result": {"resourceTemplates": templates}}
         if method == "resources/read":
             return await self._read_resource(msg_id, params, allowed)
+        if method == "resources/subscribe":
+            return await self._subscribe(msg_id, params, scope, allowed)
+        if method == "resources/unsubscribe":
+            await self._unsubscribe(str(params.get("uri", "")), scope)
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
         if method == "prompts/list":
             prompts = await self.list_prompts(allowed)
             return {"jsonrpc": "2.0", "id": msg_id, "result": {"prompts": prompts}}
@@ -401,7 +415,18 @@ class Gateway:
         for feature in ("resources", "prompts"):
             if any(feature in u.capabilities for u in self.upstreams.values()):
                 caps[feature] = {"listChanged": self.notifies}
+        if self._subscribable(None):
+            caps["resources"]["subscribe"] = True
         return caps
+
+    def _subscribable(self, allowed: Collection[str] | None) -> list[str]:
+        """Servers the client may use whose resources can be subscribed to."""
+        return [
+            name
+            for name in self._serving(allowed, "resources")
+            if isinstance(caps := self.upstreams[name].capabilities.get("resources"), dict)
+            and caps.get("subscribe")
+        ]
 
     def _serving(self, allowed: Collection[str] | None, feature: str) -> list[str]:
         """Servers, in config order, that the client may use and that offer ``feature``."""
@@ -463,18 +488,23 @@ class Gateway:
             templates.extend(items)
         return templates
 
+    def _known_owners(self, uri: str, candidates: list[str]) -> list[str]:
+        """Servers that listed the URI, or else whose URI templates match it."""
+        return [n for n in candidates if uri in self._resource_uris.get(n, ())] or [
+            n for n in candidates if any(t.fullmatch(uri) for t in self._templates.get(n, ()))
+        ]
+
+    def _owners(self, uri: str, candidates: list[str]) -> list[str]:
+        """The servers to try for a URI; for one nobody listed yet, each in turn."""
+        return self._known_owners(uri, candidates) or candidates
+
     async def _read_resource(
         self, client_id: Any, params: Message, allowed: Collection[str] | None
     ) -> Message:
         uri = params.get("uri")
         if not isinstance(uri, str):
             return _error(client_id, -32602, "resources/read needs a uri")
-        candidates = self._serving(allowed, "resources")
-        owners = (
-            [n for n in candidates if uri in self._resource_uris.get(n, ())]
-            or [n for n in candidates if any(t.fullmatch(uri) for t in self._templates.get(n, ()))]
-            or candidates  # not listed yet: ask each server in turn
-        )
+        owners = self._owners(uri, self._serving(allowed, "resources"))
         reply: Message = _error(client_id, -32002, f"resource not found: {uri}")
         for name in owners:
             blocked = self.wardens[name].admit_resource(uri)
@@ -490,6 +520,59 @@ class Gateway:
                 return {"jsonrpc": "2.0", "id": client_id, "result": result}
             reply = {**answer, "id": client_id}
         return reply
+
+    async def _subscribe(
+        self, client_id: Any, params: Message, scope: str, allowed: Collection[str] | None
+    ) -> Message:
+        uri = params.get("uri")
+        if not isinstance(uri, str):
+            return _error(client_id, -32602, "resources/subscribe needs a uri")
+        # Servers tend to accept a subscription to any URI, so trying each in turn
+        # would pick the first rather than the owner: find who serves it first, among
+        # all servers, so a URI of a server this client may not use goes nowhere.
+        every = self._subscribable(None)
+        known = self._known_owners(uri, every)
+        if not known:
+            await asyncio.gather(self.list_resources(), self.list_resource_templates())
+            known = self._known_owners(uri, every)
+        candidates = self._subscribable(allowed)
+        owners = [n for n in known if n in candidates] if known else candidates
+        reply: Message = _error(client_id, -32002, f"resource not found: {uri}")
+        for name in owners:
+            if self.wardens[name].admit_resource(uri, event="resource_subscribe") is not None:
+                return _error(client_id, -32002, f"resource not found: {uri}")
+            scopes = self._subscriptions.get((name, uri))
+            if scopes:  # already subscribed upstream for another client
+                scopes.add(scope)
+                return {"jsonrpc": "2.0", "id": client_id, "result": {}}
+            try:
+                answer = await self.upstreams[name].call("resources/subscribe", {"uri": uri})
+            except UpstreamError as exc:
+                reply = _error(client_id, -32000, f"mcp-warden upstream error: {exc}")
+                continue
+            if "result" in answer:
+                self._subscriptions.setdefault((name, uri), set()).add(scope)
+                return {"jsonrpc": "2.0", "id": client_id, "result": {}}
+            reply = {**answer, "id": client_id}
+        return reply
+
+    async def _unsubscribe(self, uri: str | None, scope: str) -> None:
+        """Drop a client's subscription to ``uri``, or to everything when ``uri`` is None."""
+        for key in [k for k in self._subscriptions if uri is None or k[1] == uri]:
+            scopes = self._subscriptions[key]
+            scopes.discard(scope)
+            if scopes:
+                continue
+            del self._subscriptions[key]
+            name, sub_uri = key
+            try:
+                await self.upstreams[name].call("resources/unsubscribe", {"uri": sub_uri})
+            except UpstreamError as exc:
+                log.warning("%s: unsubscribe from %s failed: %s", name, sub_uri, exc)
+
+    async def forget(self, scope: str) -> None:
+        """Release what a client held when its session ends."""
+        await self._unsubscribe(None, scope)
 
     async def list_prompts(self, allowed: Collection[str] | None = None) -> list[Message]:
         names = self._serving(allowed, "prompts")

@@ -127,6 +127,12 @@ class Warden:
             if blocked is not None:
                 return Outcome(to_client=[{"jsonrpc": "2.0", "id": msg["id"], "result": blocked}])
             self._pending[_id_key(msg["id"])] = _Pending(method, self._clock(), target)
+        elif method == "resources/subscribe":
+            uri = str(params.get("uri", ""))
+            if self.admit_resource(uri, event="resource_subscribe") is not None:
+                # Answer as if the resource did not exist, so a denied URI stays hidden.
+                error = {"code": -32002, "message": f"resource not found: {uri}"}
+                return Outcome(to_client=[{"jsonrpc": "2.0", "id": msg["id"], "error": error}])
         elif method in _TRACKED:
             self._pending[_id_key(msg["id"])] = _Pending(method, self._clock())
         return Outcome(to_server=[msg])
@@ -306,7 +312,7 @@ class Warden:
 
     # ------------------------------------------------------------------ resources and prompts
 
-    def admit_resource(self, uri: str) -> dict[str, Any] | None:
+    def admit_resource(self, uri: str, event: str = "resource_read") -> dict[str, Any] | None:
         """Check a ``resources/read`` against the policy before it reaches the server.
 
         Returns None to forward the read, or the result to answer with instead.
@@ -314,7 +320,7 @@ class Warden:
         reason = self.policy.resource_allowed(uri)
         if reason is None:
             return None
-        self._deny("resource_read", reason, uri=uri)
+        self._deny(event, reason, uri=uri)
         return blocked_resource(uri, reason) if self.policy.enforcing else None
 
     def admit_prompt(self, name: str) -> dict[str, Any] | None:

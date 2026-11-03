@@ -354,3 +354,38 @@ def test_standing_stream_gets_list_changed_for_allowed_servers(make_server):
     # Ending the session ends its stream.
     alice.close()
     assert alice_stream.ended.wait(5)
+
+
+def test_resource_updates_reach_subscribed_sessions_only(tmp_path):
+    policy = load_policy(None)
+    command = [sys.executable, str(FAKE_SERVER), "-", "--resources", "a"]
+    server = GatewayServer([ServerSpec("a", policy, command)], port=0)
+    server.start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        alice, bob = StreamableHTTP(server.url), StreamableHTTP(server.url)
+        init = rpc(alice, INIT)
+        assert init["result"]["capabilities"]["resources"]["subscribe"] is True
+        rpc(bob, INIT)
+        streams = [SSEReader(server.url, {"Mcp-Session-Id": c.session_id}) for c in (alice, bob)]
+        time.sleep(0.2)
+        subscribe = {"jsonrpc": "2.0", "id": 1, "method": "resources/subscribe"}
+        assert rpc(alice, {**subscribe, "params": {"uri": "memo://a/notes"}})["result"] == {}
+
+        rpc(bob, call(2, "a__touch"))
+        (update,) = streams[0].wait_for(1)
+        assert update["method"] == "notifications/resources/updated"
+        assert update["params"]["uri"] == "memo://a/notes"
+        assert "ghp_" not in json.dumps(update)
+        time.sleep(0.3)
+        assert streams[1].events == []
+
+        # Ending alice's session releases the upstream subscription.
+        alice.close()
+        deadline = time.monotonic() + 5
+        while server.gateway._subscriptions and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert server.gateway._subscriptions == {}
+    finally:
+        server.shutdown()
+        server.close()

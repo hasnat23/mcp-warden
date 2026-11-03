@@ -254,3 +254,12 @@ def test_single_server_resource_reads_are_redacted_and_scanned(tmp_path):
     events = audit_events(tmp_path)
     assert events[0]["event"] == "resource_read" and events[0]["redactions"] == 1
     assert events[1]["event"] == "prompt_get" and events[1]["blocked"]
+
+
+def test_subscribing_to_a_denied_resource_is_not_found(tmp_path):
+    w = make(tmp_path, **RESOURCE_RULES)
+    out = w.from_client(rpc(1, "resources/subscribe", uri="file:///etc/passwd"))
+    assert out.to_server == [] and out.to_client[0]["error"]["code"] == -32002
+    assert w.from_client(rpc(2, "resources/subscribe", uri="file:///app/a.py")).to_server
+    events = audit_events(tmp_path)
+    assert [(e["event"], e["decision"]) for e in events] == [("resource_subscribe", "deny")]
