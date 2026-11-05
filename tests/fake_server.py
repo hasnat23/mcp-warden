@@ -4,7 +4,8 @@ Tool definitions come from the JSON file given as the first argument ("-" for
 the default) or in $FAKE_TOOLS (default: two benign tools). With --resources NAME
 it also serves resources under memo://NAME/ (subscribable; the "touch" tool reports
 an update to each subscribed URI) and a prompt. Calling a tool returns canned text
-chosen by its name.
+chosen by its name; "sample" and "roots" first send the client a sampling/createMessage
+or roots/list request and return its answer.
 """
 
 import json
@@ -49,6 +50,17 @@ def send(msg):
 
 RESOURCE_TAG = sys.argv[sys.argv.index("--resources") + 1] if "--resources" in sys.argv else None
 SUBSCRIBED = set()
+
+
+def ask_client(method, params):
+    """Send the client a request mid-call and wait for its answer (sampling, roots)."""
+    request_id = f"srv-{method}"
+    send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+    for line in sys.stdin:
+        msg = json.loads(line)
+        if msg.get("id") == request_id and "method" not in msg:
+            return msg.get("result", msg.get("error"))
+    return None
 
 
 def resource_text(path):
@@ -133,6 +145,15 @@ def main():
                     params = {"uri": uri, "title": "token ghp_" + "d" * 36}
                     method = "notifications/resources/updated"
                     send({"jsonrpc": "2.0", "method": method, "params": params})
+            if name == "sample":  # ask the client's model, and return what it said
+                prompt = {"role": "user", "content": {"type": "text", "text": args["prompt"]}}
+                answer = ask_client(
+                    "sampling/createMessage", {"messages": [prompt], "maxTokens": 50}
+                )
+                RESPONSES[name] = json.dumps(answer).replace("{", "{{").replace("}", "}}")
+            if name == "roots":
+                answer = ask_client("roots/list", {})
+                RESPONSES[name] = json.dumps(answer).replace("{", "{{").replace("}", "}}")
             text = RESPONSES.get(name, "ok").format(**args)
             result = {"content": [{"type": "text", "text": text}], "isError": False}
         elif RESOURCE_TAG and (result := resources_method(method, msg.get("params") or {})):

@@ -47,6 +47,8 @@ class Policy:
     resource_deny: list[str] = field(default_factory=list)
     prompt_allow: list[str] = field(default_factory=list)
     prompt_deny: list[str] = field(default_factory=list)
+    server_request_allow: list[str] = field(default_factory=list)
+    server_request_deny: list[str] = field(default_factory=list)
     argument_rules: list[ArgumentRule] = field(default_factory=list)
     rate_limits: list[RateLimit] = field(default_factory=list)
     scan_descriptions: Action = "block"
@@ -76,6 +78,12 @@ class Policy:
     def prompt_allowed(self, name: str) -> str | None:
         """Return a denial reason, or None if the prompt name passes allow/deny lists."""
         return _check_lists("prompt", name, self.prompt_allow, self.prompt_deny)
+
+    def server_request_allowed(self, method: str) -> str | None:
+        """Return a denial reason for a request the server sends the client (e.g. sampling)."""
+        return _check_lists(
+            "server request", method, self.server_request_allow, self.server_request_deny
+        )
 
     def check_arguments(self, name: str, arguments: dict[str, Any]) -> str | None:
         for rule in self.argument_rules:
@@ -158,6 +166,7 @@ def policy_from_dict(data: dict[str, Any], base_dir: Path | None = None) -> Poli
     allow, deny = lists("tools")
     resource_allow, resource_deny = lists("resources")
     prompt_allow, prompt_deny = lists("prompts")
+    server_request_allow, server_request_deny = lists("server_requests")
 
     arg_rules = []
     for i, raw in enumerate(data.get("arguments") or []):
@@ -198,6 +207,8 @@ def policy_from_dict(data: dict[str, Any], base_dir: Path | None = None) -> Poli
         resource_deny=resource_deny,
         prompt_allow=prompt_allow,
         prompt_deny=prompt_deny,
+        server_request_allow=server_request_allow,
+        server_request_deny=server_request_deny,
         argument_rules=arg_rules,
         rate_limits=limits,
         scan_descriptions=_action(scan.get("descriptions"), "scan.descriptions", "block"),

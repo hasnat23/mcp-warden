@@ -39,6 +39,12 @@ All notable changes to this project are documented here. The format follows
   that owns the URI, shared upstream between clients and released with the last one or when
   a session ends, and `notifications/resources/updated` goes only to subscribed clients.
   The policy's resource rules apply to subscriptions too.
+- Requests from servers to the client (`sampling/createMessage`, `elicitation/create`,
+  `roots/list`) are forwarded through the gateway to the client whose call they came with,
+  and the gateway offers upstreams only the client features the client has. In every mode
+  they are redacted, scanned for injected instructions (refused when `scan.results` is
+  `block`), checked against new `server_requests:` allow and deny lists, and audited as
+  `server_request` events.
 
 ### Fixed
 - The single-server proxy now scans `resources/read` and `prompts/get` results for injected

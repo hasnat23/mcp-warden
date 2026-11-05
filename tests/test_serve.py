@@ -266,8 +266,8 @@ def test_serve_cli_rejects_token_env_with_clients(tmp_path, monkeypatch, capsys)
     assert "cannot be combined" in capsys.readouterr().err
 
 
-def with_progress(msg_id, name, token):
-    msg = call(msg_id, name)
+def with_progress(msg_id, name, token, **arguments):
+    msg = call(msg_id, name, **arguments)
     msg["params"]["_meta"] = {"progressToken": token}
     return msg
 
@@ -389,3 +389,41 @@ def test_resource_updates_reach_subscribed_sessions_only(tmp_path):
     finally:
         server.shutdown()
         server.close()
+
+
+def test_server_requests_reach_the_calling_session(make_server):
+    server = make_server()
+    alice, bob = StreamableHTTP(server.url), StreamableHTTP(server.url)
+    init = {**INIT, "params": {**INIT["params"], "capabilities": {"sampling": {}}}}
+    rpc(alice, init)
+    rpc(bob, init)
+    streams = [SSEReader(server.url, {"Mcp-Session-Id": c.session_id}) for c in (alice, bob)]
+    time.sleep(0.2)
+
+    def respond(request, text):
+        result = {"role": "assistant", "content": {"type": "text", "text": text}, "model": "m"}
+        answer = {"jsonrpc": "2.0", "id": request["id"], "result": result}
+        status, _, _ = raw(server.url, body=answer, headers={"Mcp-Session-Id": alice.session_id})
+        assert status == 202
+
+    # A plain JSON call: the request comes on alice's GET stream.
+    done = {}
+    worker = threading.Thread(
+        target=lambda: done.update(reply=rpc(alice, call(1, "local__sample", prompt="hi")))
+    )
+    worker.start()
+    (request,) = streams[0].wait_for(1)
+    assert request["method"] == "sampling/createMessage"
+    respond(request, "from the GET stream")
+    worker.join(10)
+    assert "from the GET stream" in done["reply"]["result"]["content"][0]["text"]
+
+    # A streamed call: the request comes inside the call's own SSE response.
+    out = []
+    for msg in alice.post(with_progress(2, "local__sample", "tok", prompt="hi")):
+        out.append(msg)
+        if msg.get("method") == "sampling/createMessage":
+            respond(msg, "from the call stream")
+    assert "from the call stream" in out[-1]["result"]["content"][0]["text"]
+    assert len(streams[0].events) == 1  # nothing more on the GET stream
+    assert streams[1].events == []  # bob is never asked

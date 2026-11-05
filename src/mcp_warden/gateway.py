@@ -17,7 +17,7 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from typing import Any, BinaryIO
 
 from mcp_warden import __version__
@@ -33,11 +33,21 @@ log = logging.getLogger("mcp_warden")
 
 Message = dict[str, Any]
 Notify = Callable[[str, Message], None]
+# Answers a request an upstream server sends its client: (server, request, id of the
+# gateway's request it arrived with, if known) -> response.
+OnRequest = Callable[[str, Message, Any], Awaitable[Message]]
 
 CLIENT_INFO = {"name": "mcp-warden", "version": __version__}
-# Where an upstream notification goes: (message, client scope or None for every
-# client, upstream server name).
-Deliver = Callable[[Message, "str | None", str], None]
+# Where an upstream notification or request goes: (message, client scope or None for
+# every client, upstream server name). Returns False when it could not be sent.
+Deliver = Callable[[Message, "str | None", str], "bool | None"]
+
+# Client features a server can ask for, by the requests that use them.
+CLIENT_FEATURES = {
+    "sampling/createMessage": "sampling",
+    "elicitation/create": "elicitation",
+    "roots/list": "roots",
+}
 
 
 UPDATED = "notifications/resources/updated"
@@ -71,11 +81,14 @@ def _error(msg_id: Any, code: int, message: str) -> Message:
 class Upstream:
     """One MCP server the gateway talks to as a client."""
 
-    def __init__(self, name: str, on_notify: Notify):
+    def __init__(self, name: str, on_notify: Notify, on_request: OnRequest | None = None):
         self.name = name
         self._on_notify = on_notify
+        self._on_request = on_request
         self._ids = itertools.count(1)
         self.capabilities: dict[str, Any] = {}
+        # What the gateway tells the server it can do as a client.
+        self.client_capabilities: dict[str, Any] = {}
 
     def next_id(self) -> int:
         return next(self._ids)
@@ -101,7 +114,11 @@ class Upstream:
     async def initialize(self) -> None:
         reply = await self.call(
             "initialize",
-            {"protocolVersion": PROTOCOL_VERSION, "capabilities": {}, "clientInfo": CLIENT_INFO},
+            {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": self.client_capabilities,
+                "clientInfo": CLIENT_INFO,
+            },
         )
         if "error" in reply:
             raise UpstreamError(f"{self.name}: initialize failed: {reply['error']}")
@@ -110,24 +127,42 @@ class Upstream:
         self.capabilities = caps if isinstance(caps, dict) else {}
         await self.notify({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
-    def _incoming(self, msg: Any) -> Message | None:
-        """Handle a non-response message; returns a reply to send back, if any."""
+    def _incoming(self, msg: Any) -> bool:
+        """Pass on a notification; True if ``msg`` is a request that needs answering."""
         if not isinstance(msg, dict) or "method" not in msg:
-            return None
+            return False
         if "id" in msg:
-            # The gateway advertises no client capabilities (sampling, roots, ...).
-            return _error(msg["id"], -32601, f"{msg['method']} is not supported by mcp-warden")
+            return True
         self._on_notify(self.name, msg)
-        return None
+        return False
+
+    async def _answer(self, msg: Message, related: Any = None) -> Message:
+        """The response to a request from the server (sampling, roots, ping, ...)."""
+        if msg.get("method") == "ping":
+            return {"jsonrpc": "2.0", "id": msg["id"], "result": {}}
+        if self._on_request is None:
+            return _error(msg["id"], -32601, f"{msg['method']} is not supported by mcp-warden")
+        try:
+            return await self._on_request(self.name, msg, related)
+        except Exception as exc:
+            log.exception("%s: answering %s failed", self.name, msg.get("method"))
+            return _error(msg["id"], -32603, f"mcp-warden internal error: {exc}")
 
 
 class StdioUpstream(Upstream):
-    def __init__(self, name: str, command: Sequence[str], on_notify: Notify):
-        super().__init__(name, on_notify)
+    def __init__(
+        self,
+        name: str,
+        command: Sequence[str],
+        on_notify: Notify,
+        on_request: OnRequest | None = None,
+    ):
+        super().__init__(name, on_notify, on_request)
         self.command = list(command)
         self._proc: asyncio.subprocess.Process | None = None
         self._waiting: dict[Any, asyncio.Future[Message]] = {}
         self._reader: asyncio.Task[None] | None = None
+        self._answering: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
         self._proc = await asyncio.create_subprocess_exec(
@@ -150,13 +185,21 @@ class StdioUpstream(Upstream):
                 if future is not None and not future.done():
                     future.set_result(msg)
                 continue
-            reply = self._incoming(msg)
-            if reply is not None:
-                await self._write(reply)
+            if self._incoming(msg):
+                # Answered on the side: the reply may wait on the client, and this
+                # loop must keep reading meanwhile (e.g. the tool result after it).
+                task = asyncio.create_task(self._reply_to(msg))
+                self._answering.add(task)
+                task.add_done_callback(self._answering.discard)
         for future in self._waiting.values():
             if not future.done():
                 future.set_exception(UpstreamError(f"{self.name}: server exited"))
         self._waiting.clear()
+
+    async def _reply_to(self, msg: Message) -> None:
+        reply = await self._answer(msg)
+        with contextlib.suppress(ConnectionError):
+            await self._write(reply)
 
     async def _write(self, msg: Message) -> None:
         assert self._proc is not None and self._proc.stdin is not None
@@ -199,11 +242,19 @@ class StdioUpstream(Upstream):
 
 
 class HttpUpstream(Upstream):
-    def __init__(self, name: str, transport: StreamableHTTP, on_notify: Notify):
-        super().__init__(name, on_notify)
+    def __init__(
+        self,
+        name: str,
+        transport: StreamableHTTP,
+        on_notify: Notify,
+        on_request: OnRequest | None = None,
+    ):
+        super().__init__(name, on_notify, on_request)
         self.transport = transport
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
         await self.initialize()
 
     def _post(self, msg: Message) -> Message | None:
@@ -217,9 +268,12 @@ class HttpUpstream(Upstream):
             ):
                 response = reply
                 continue
-            answer = self._incoming(reply)
-            if answer is not None:
-                for _ in self.transport.post(answer):
+            if self._incoming(reply) and self._loop is not None:
+                # The server waits for this answer before it finishes the response.
+                pending = asyncio.run_coroutine_threadsafe(
+                    self._answer(reply, msg.get("id")), self._loop
+                )
+                for _ in self.transport.post(pending.result()):
                     pass
         return response
 
@@ -273,6 +327,14 @@ class Gateway:
         self._calls: dict[tuple[str, str], tuple[str, int]] = {}
         # Whether clients can be told the tool list changed (stdio, or serve's GET stream).
         self.notifies = True
+        # The client a server's request goes to when no call ties it to one: the only
+        # client, on stdio; None where several share the gateway.
+        self.default_scope: str | None = ""
+        self.client_timeout = 300.0
+        self._client_caps: dict[str, Message] = {}
+        # (client scope, id the gateway gave a request it forwarded) -> its response
+        self._forwarded: dict[tuple[str, str], asyncio.Future[Message]] = {}
+        self._forward_ids = itertools.count(1)
         self._started = False
         for spec in self.specs:
             path = spec.policy.audit_path
@@ -283,20 +345,36 @@ class Gateway:
             )
             if spec.url:
                 self.upstreams[spec.name] = HttpUpstream(
-                    spec.name, StreamableHTTP(spec.url, spec.headers), self._upstream_notification
+                    spec.name,
+                    StreamableHTTP(spec.url, spec.headers),
+                    self._upstream_notification,
+                    self._server_request,
                 )
             else:
                 self.upstreams[spec.name] = StdioUpstream(
-                    spec.name, spec.command, self._upstream_notification
+                    spec.name, spec.command, self._upstream_notification, self._server_request
                 )
 
     # ------------------------------------------------------------------ lifecycle
 
-    async def start(self) -> None:
+    async def start(self, client_capabilities: Message | None = None) -> None:
+        """Start the upstreams, offering them the client features the client has.
+
+        With ``client_capabilities`` unknown (several clients to come), every feature
+        is offered and a request for one a client lacks is refused when it comes.
+        """
         if self._started:
             return
         self._started = True
         self._loop = asyncio.get_running_loop()
+        features = set(CLIENT_FEATURES.values())
+        if client_capabilities is not None:
+            features &= set(client_capabilities)
+        offered: Message = {f: {} for f in sorted(features)}
+        if "roots" in offered and self.default_scope is not None:
+            offered["roots"] = {"listChanged": True}  # passed on from the one client
+        for upstream in self.upstreams.values():
+            upstream.client_capabilities = offered
         results = await asyncio.gather(
             *(u.start() for u in self.upstreams.values()), return_exceptions=True
         )
@@ -362,17 +440,30 @@ class Gateway:
         since their request ids can collide. ``allowed`` limits the client to some
         upstream servers; the others are invisible to it.
         """
+        if isinstance(msg, dict) and "id" in msg and "method" not in msg:
+            # The client answering a request a server sent it through us.
+            future = self._forwarded.pop((scope, repr(msg["id"])), None)
+            if future is not None and not future.done():
+                future.set_result(msg)
+            return None
         if not isinstance(msg, dict) or "method" not in msg:
             return None
         method, params = msg["method"], msg.get("params") or {}
         if method == "notifications/cancelled":
             await self._cancel(params, scope)
             return None
+        if method == "notifications/roots/list_changed" and self.default_scope is not None:
+            for upstream in self.upstreams.values():
+                if "roots" in upstream.client_capabilities:
+                    await upstream.notify({"jsonrpc": "2.0", "method": method})
+            return None
         if "id" not in msg:
             return None
         msg_id = msg["id"]
         if method == "initialize":
-            await self.start()
+            caps = params.get("capabilities")
+            self._client_caps[scope] = caps if isinstance(caps, dict) else {}
+            await self.start(self._client_caps[scope] if self.default_scope is not None else None)
             version = params.get("protocolVersion")
             return {
                 "jsonrpc": "2.0",
@@ -572,7 +663,61 @@ class Gateway:
 
     async def forget(self, scope: str) -> None:
         """Release what a client held when its session ends."""
+        self._client_caps.pop(scope, None)
+        for key in [k for k in self._forwarded if k[0] == scope]:
+            self._forwarded.pop(key).cancel()
         await self._unsubscribe(None, scope)
+
+    # ------------------------------------------------------------------ server requests
+
+    def _requester(self, server: str, related: Any) -> str | None:
+        """The client a server's request belongs to: the one whose call it came with."""
+        if related is not None:
+            for (scope, _), call in self._calls.items():
+                if call == (server, related):
+                    return scope
+        scopes = {scope for (scope, _), (name, _) in self._calls.items() if name == server}
+        if len(scopes) == 1:
+            return scopes.pop()
+        if not scopes:
+            return self.default_scope
+        return None  # several clients have calls in flight there: ambiguous
+
+    async def _server_request(self, server: str, msg: Message, related: Any) -> Message:
+        """Forward a server's request (sampling, elicitation, roots) to its client."""
+        method, server_id = str(msg.get("method")), msg["id"]
+        forward, refusal = self.wardens[server].screen_server_request(msg)
+        if refusal is not None:
+            return refusal
+        scope = self._requester(server, related)
+        if scope is None:
+            return _error(server_id, -32603, f"mcp-warden: no single client to send {method} to")
+        feature = CLIENT_FEATURES.get(method)
+        if feature is None or feature not in self._client_caps.get(scope, {}):
+            return _error(server_id, -32601, f"{method} is not supported by the client")
+        client_id = f"mcp-warden-{next(self._forward_ids)}"
+        key = (scope, repr(client_id))
+        future: asyncio.Future[Message] = asyncio.get_running_loop().create_future()
+        self._forwarded[key] = future
+        try:
+            if self.deliver({**forward, "id": client_id}, scope, server) is False:
+                return _error(server_id, -32603, f"mcp-warden: the client cannot take {method} now")
+            answer = await asyncio.wait_for(future, self.client_timeout)
+        except asyncio.TimeoutError:
+            cancel = {"requestId": client_id, "reason": "timed out"}
+            self.deliver(
+                {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": cancel},
+                scope,
+                server,
+            )
+            return _error(server_id, -32603, f"mcp-warden: the client did not answer {method}")
+        except asyncio.CancelledError:
+            if not future.cancelled():
+                raise  # the gateway is shutting down, not the client leaving
+            return _error(server_id, -32603, "mcp-warden: the client went away")
+        finally:
+            self._forwarded.pop(key, None)
+        return {**answer, "id": server_id}
 
     async def list_prompts(self, allowed: Collection[str] | None = None) -> list[Message]:
         names = self._serving(allowed, "prompts")
