@@ -73,6 +73,37 @@ def blocked_prompt(reason: str) -> dict[str, Any]:
     return {"messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
 
 
+def refused(msg_id: Any, reason: str) -> dict[str, Any]:
+    """The answer to a server's request (e.g. sampling) that the client never sees.
+
+    Code -1 is what the spec uses for a user declining a sampling request.
+    """
+    return {
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "error": {"code": -1, "message": f"Blocked by mcp-warden: {reason}"},
+    }
+
+
+def _request_texts(method: str, params: Any) -> list[tuple[str, str]]:
+    """The text a sampling or elicitation request would put in front of the model or user."""
+    if not isinstance(params, dict):
+        return []
+    out = []
+    if method == "sampling/createMessage":
+        if isinstance(params.get("systemPrompt"), str):
+            out.append(("systemPrompt", params["systemPrompt"]))
+        for i, m in enumerate(params.get("messages") or []):
+            content = m.get("content") if isinstance(m, dict) else None
+            blocks = content if isinstance(content, list) else [content]
+            for j, block in enumerate(blocks):
+                if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    out.append((f"messages[{i}].content[{j}]", block["text"]))
+    elif method == "elicitation/create" and isinstance(params.get("message"), str):
+        out.append(("message", params["message"]))
+    return out
+
+
 # Requests whose responses the warden inspects in single-server mode.
 _TRACKED = ("tools/list", "resources/list", "prompts/list")
 
@@ -177,6 +208,11 @@ class Warden:
     # ------------------------------------------------------------------ server -> client
 
     def from_server(self, msg: Any) -> Outcome:
+        if isinstance(msg, dict) and "method" in msg and "id" in msg and msg["method"] != "ping":
+            forward, refusal = self.screen_server_request(msg)
+            if refusal is not None:
+                return Outcome(to_server=[refusal])
+            return Outcome(to_client=[forward])
         if not isinstance(msg, dict) or "method" in msg or "id" not in msg:
             return Outcome(to_client=[msg])
         pending = self._pending.pop(_id_key(msg["id"]), None)
@@ -309,6 +345,54 @@ class Warden:
             else None,
         )
         return out
+
+    # ------------------------------------------------------------------ server requests
+
+    def screen_server_request(self, msg: Message) -> tuple[Message, Message | None]:
+        """Check a request the server sends the client, such as sampling or elicitation.
+
+        Sampling puts server-written text in front of the client's model, which makes it
+        an injection vector like a tool result. Returns the (redacted) request to pass
+        on, and the error to answer the server with instead when it is refused.
+        """
+        method = str(msg.get("method"))
+        reason = self.policy.server_request_allowed(method)
+        out, redactions = msg, 0
+        findings: list[Finding] = []
+        if reason is None:
+            if self.policy.redact and method in ("sampling/createMessage", "elicitation/create"):
+                params, redactions = self.redactor.redact(msg.get("params"))
+                out = {**msg, "params": params}
+            if self.policy.scan_results != "off":
+                for location, text in _request_texts(method, out.get("params")):
+                    findings.extend(scan_text(text, location=location))
+                self.findings.extend(findings)
+            if self.policy.scan_results == "block" and any(
+                f.severity >= self.policy.block_severity for f in findings
+            ):
+                worst = max(findings, key=lambda f: f.severity)
+                reason = f"possible prompt injection ({worst.rule} {worst.message})"
+        for f in findings:
+            log.warning(
+                "[%s] %s in %s at %s: %s", f.severity, f.rule, method, f.location, f.message
+            )
+        decision = "allow" if reason is None else "deny" if self.policy.enforcing else "would_deny"
+        if reason is not None:
+            log.warning(
+                "%s %s: %s", "refused" if decision == "deny" else "would refuse", method, reason
+            )
+        self._emit(
+            "server_request",
+            method=method,
+            decision=decision,
+            reason=reason,
+            redactions=redactions,
+            findings=[f.to_dict() for f in findings],
+        )
+        if decision == "deny":
+            assert reason is not None
+            return out, refused(msg.get("id"), reason)
+        return out, None
 
     # ------------------------------------------------------------------ resources and prompts
 

@@ -84,6 +84,8 @@ class GatewayServer:
     ):
         self.gateway = Gateway(specs, sinks=sinks)
         self.gateway.deliver = self._deliver
+        self.gateway.default_scope = None  # several clients: a request needs its call
+        self.gateway.client_timeout = request_timeout
         self.host, self.port, self.path = host, port, path
         if token is not None and clients:
             raise ValueError("use a shared token or per-client tokens, not both")
@@ -222,10 +224,15 @@ class GatewayServer:
             client = self.sessions[sid]
         return client is None or client.servers is None or server in client.servers
 
-    def _deliver(self, msg: Message, scope: str | None, server: str) -> None:
-        """Route an upstream notification (runs on the gateway loop)."""
+    def _deliver(self, msg: Message, scope: str | None, server: str) -> bool:
+        """Route an upstream notification or request (runs on the gateway loop)."""
         with self._streams_lock:
-            if scope is not None:
+            if scope is not None and "id" in msg:
+                # A request goes out on exactly one stream: an open call stream of the
+                # client (it is likely waiting on that call), else its GET stream.
+                calls = [s for (sid, _), s in self._call_streams.items() if sid == scope]
+                targets = (calls or self._streams.get(scope, []))[:1]
+            elif scope is not None:
                 token = repr((msg.get("params") or {}).get("progressToken"))
                 call = self._call_streams.get((scope, token))
                 targets = [call] if call is not None else list(self._streams.get(scope, []))
@@ -238,6 +245,7 @@ class GatewayServer:
                 ]
         for stream in targets:
             stream.put(msg)
+        return bool(targets)
 
     def challenge(self, error: str | None = None, scope: str | None = None) -> str:
         """A WWW-Authenticate value; with OAuth it points clients at our metadata."""

@@ -180,6 +180,10 @@ prompts:                 # globs on the prompt name (without the server__ prefix
   allow: []
   deny: []
 
+server_requests:         # globs on requests the server sends the client
+  allow: []
+  deny: ["elicitation/*"]   # e.g. sampling/createMessage, elicitation/create, roots/list
+
 arguments:               # deny a call when an argument matches a regex
   - tool: "read_*"       # glob on the tool name
     arg: path            # omit to check every string argument, nested ones included
@@ -283,6 +287,20 @@ The `resources` and `prompts` allow and deny lists work like the tool lists, in 
 
 Resource subscriptions work through the gateway too, when a server offers them. `resources/subscribe` goes to the server that owns the URI, and each URI is subscribed upstream once however many clients ask. `notifications/resources/updated` reaches only the clients subscribed to that URI, over the standing `GET` stream in `serve`. The upstream subscription is dropped when the last client unsubscribes or its session ends. Subscribing to a denied URI, or to one on a server the client may not use, answers "resource not found".
 
+### Sampling, elicitation and roots
+
+Servers can send requests back to the client: `sampling/createMessage` to use the client's model, `elicitation/create` to ask the user for input, and `roots/list`. A sampling prompt is server-written text going straight to a model, so it is as much an injection vector as a tool result. mcp-warden treats it the same way, in single-server and multi-server mode:
+
+- Secrets in sampling and elicitation requests are redacted.
+- The text is scanned for injected instructions.
+- When `scan.results` is `block`, an injected request is refused before the client sees it.
+- `server_requests` allow and deny lists can refuse whole methods.
+- Every request is audited as a `server_request` event.
+
+A refused request reaches the server as error `-1`, the code the spec uses for a declined request.
+
+The gateway offers upstream servers only the features the client declared in `initialize`, then forwards each request to the client whose call it came with. In `serve`, the request goes out on that call's SSE stream when it has one, and otherwise on the client's `GET` stream. The client answers with a plain POST. Under `serve`, a request that no in-flight call ties to a single client, such as `roots/list` sent between calls, is refused.
+
 Each audit record and span gets a `server` field (`mcp_warden.server`), so `jq 'select(.server == "tracker")'` filters one upstream. Lockfiles are split per server (`warden.lock.fs.json`, ...) because pins are keyed by tool name. `${VAR}` is expanded in commands, URLs and headers, so tokens stay out of the file. A server that fails to start is logged and left out of the tool list instead of taking the others down. `--monitor`, `--audit`, `--lockfile` and `--otel` apply to every server.
 
 ## Shared HTTP gateway
@@ -341,7 +359,7 @@ ruff check . && ruff format --check . && mypy
 
 ## Roadmap
 
-- Forward server-to-client requests (sampling, elicitation, roots) through the gateway
+- Rate limits for sampling requests per server, so a server cannot run up the client's model bill
 
 ## License
 
