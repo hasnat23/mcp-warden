@@ -265,9 +265,9 @@ def test_subscribing_to_a_denied_resource_is_not_found(tmp_path):
     assert [(e["event"], e["decision"]) for e in events] == [("resource_subscribe", "deny")]
 
 
-def sampling(msg_id, text):
+def sampling(msg_id, text, max_tokens=10):
     prompt = {"role": "user", "content": {"type": "text", "text": text}}
-    return rpc(msg_id, "sampling/createMessage", messages=[prompt], maxTokens=10)
+    return rpc(msg_id, "sampling/createMessage", messages=[prompt], maxTokens=max_tokens)
 
 
 def test_sampling_requests_are_redacted_and_scanned(tmp_path):
@@ -304,3 +304,35 @@ def test_server_request_rules(tmp_path):
     monitor = make(tmp_path, mode="monitor", **rules)
     assert monitor.from_server(sampling(3, "hi")).to_client
     assert audit_events(tmp_path)[-1]["decision"] == "would_deny"
+
+
+def test_sampling_rate_limit_and_token_cap(tmp_path):
+    now = [0.0]
+    policy = policy_from_dict(
+        {
+            "rate_limits": [{"server_request": "sampling/*", "max_calls": 2, "per_seconds": 60}],
+            "server_requests": {"max_tokens": 100},
+            "audit": {"path": str(tmp_path / "audit.jsonl")},
+        }
+    )
+    w = Warden(policy, clock=lambda: now[0])
+    first = w.from_server(sampling(1, "hi", max_tokens=5000)).to_client[0]
+    assert first["params"]["maxTokens"] == 100
+    assert w.from_server(sampling(2, "hi", max_tokens=50)).to_client[0]["params"]["maxTokens"] == 50
+    (refusal,) = w.from_server(sampling(3, "hi")).to_server
+    assert refusal["error"]["code"] == -1 and "rate limit" in refusal["error"]["message"]
+    # Roots are not limited, and the window moves on.
+    assert w.from_server(rpc(4, "roots/list")).to_client
+    now[0] = 61.0
+    assert w.from_server(sampling(5, "hi")).to_client
+
+    events = audit_events(tmp_path)
+    assert events[0]["max_tokens_requested"] == 5000 and "max_tokens_requested" not in events[1]
+    assert [e["decision"] for e in events] == ["allow", "allow", "deny", "allow", "allow"]
+
+
+def test_monitor_mode_reports_token_cap_without_changing_the_request(tmp_path):
+    w = make(tmp_path, mode="monitor", server_requests={"max_tokens": 100})
+    out = w.from_server(sampling(1, "hi", max_tokens=5000)).to_client[0]
+    assert out["params"]["maxTokens"] == 5000
+    assert audit_events(tmp_path)[0]["max_tokens_requested"] == 5000

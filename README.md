@@ -183,6 +183,7 @@ prompts:                 # globs on the prompt name (without the server__ prefix
 server_requests:         # globs on requests the server sends the client
   allow: []
   deny: ["elicitation/*"]   # e.g. sampling/createMessage, elicitation/create, roots/list
+  max_tokens: 2000       # cap on maxTokens in sampling requests
 
 arguments:               # deny a call when an argument matches a regex
   - tool: "read_*"       # glob on the tool name
@@ -193,6 +194,7 @@ arguments:               # deny a call when an argument matches a regex
 rate_limits:             # sliding window; a glob limit is one budget shared by all matches
   - { tool: "*", max_calls: 120, per_seconds: 60 }
   - { tool: "send_email", max_calls: 5, per_seconds: 3600 }
+  - { server_request: "sampling/*", max_calls: 20, per_seconds: 3600 }   # the client's model
 
 scan:
   descriptions: block    # block | warn | off
@@ -295,6 +297,7 @@ Servers can send requests back to the client: `sampling/createMessage` to use th
 - The text is scanned for injected instructions.
 - When `scan.results` is `block`, an injected request is refused before the client sees it.
 - `server_requests` allow and deny lists can refuse whole methods.
+- Rate limits with `server_request:` instead of `tool:` cap how often a server may ask, and `server_requests.max_tokens` lowers a sampling request's `maxTokens` to the cap, so a server cannot run up the client's model bill.
 - Every request is audited as a `server_request` event.
 
 A refused request reaches the server as error `-1`, the code the spec uses for a declined request.
@@ -359,7 +362,7 @@ ruff check . && ruff format --check . && mypy
 
 ## Roadmap
 
-- Rate limits for sampling requests per server, so a server cannot run up the client's model bill
+- Per-user limits in `serve`, so one client cannot use up a server's rate limits for everyone
 
 ## License
 
