@@ -127,6 +127,7 @@ class Warden:
         self.sinks = list(sinks)
         self.redactor = Redactor.build(policy.redact_extra)
         self.limiter = RateLimiter(policy.rate_limits, clock=clock)
+        self.request_limiter = RateLimiter(policy.server_request_limits, clock=clock)
         self.lock = Lockfile.load(policy.lockfile) if policy.lockfile else None
         # Trust on first use: with no lockfile yet, the first listing becomes the pin.
         self._tofu = self.lock is not None and not self.lock.exists
@@ -376,6 +377,12 @@ class Warden:
             log.warning(
                 "[%s] %s in %s at %s: %s", f.severity, f.rule, method, f.location, f.message
             )
+        clamped = None
+        if reason is None:
+            # Counted only for requests that would otherwise go through.
+            reason = self.request_limiter.check(method)
+        if reason is None and method == "sampling/createMessage":
+            out, clamped = self._cap_tokens(out)
         decision = "allow" if reason is None else "deny" if self.policy.enforcing else "would_deny"
         if reason is not None:
             log.warning(
@@ -388,11 +395,27 @@ class Warden:
             reason=reason,
             redactions=redactions,
             findings=[f.to_dict() for f in findings],
+            **({"max_tokens_requested": clamped} if clamped is not None else {}),
         )
         if decision == "deny":
             assert reason is not None
             return out, refused(msg.get("id"), reason)
         return out, None
+
+    def _cap_tokens(self, msg: Message) -> tuple[Message, Any]:
+        """Lower a sampling request's maxTokens to the policy's cap; returns what it asked."""
+        cap = self.policy.sampling_max_tokens
+        params = msg.get("params")
+        if cap is None or not isinstance(params, dict):
+            return msg, None
+        asked = params.get("maxTokens")
+        if isinstance(asked, int) and not isinstance(asked, bool) and asked <= cap:
+            return msg, None
+        if not self.policy.enforcing:
+            log.warning("would cap sampling maxTokens %r at %d", asked, cap)
+            return msg, asked
+        log.warning("capped sampling maxTokens %r at %d", asked, cap)
+        return {**msg, "params": {**params, "maxTokens": cap}}, asked
 
     # ------------------------------------------------------------------ resources and prompts
 

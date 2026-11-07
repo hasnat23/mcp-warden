@@ -45,6 +45,9 @@ All notable changes to this project are documented here. The format follows
   they are redacted, scanned for injected instructions (refused when `scan.results` is
   `block`), checked against new `server_requests:` allow and deny lists, and audited as
   `server_request` events.
+- Limits on server requests: `rate_limits` entries with `server_request: "sampling/*"`
+  instead of `tool:`, and `server_requests.max_tokens` to cap `maxTokens` in sampling
+  requests (the original is recorded as `max_tokens_requested`).
 
 ### Fixed
 - The single-server proxy now scans `resources/read` and `prompts/get` results for injected

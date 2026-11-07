@@ -49,6 +49,10 @@ class Policy:
     prompt_deny: list[str] = field(default_factory=list)
     server_request_allow: list[str] = field(default_factory=list)
     server_request_deny: list[str] = field(default_factory=list)
+    # Limits on requests the server sends the client (``tool`` holds the method glob).
+    server_request_limits: list[RateLimit] = field(default_factory=list)
+    # Upper bound on maxTokens in sampling requests, so a server cannot ask for more.
+    sampling_max_tokens: int | None = None
     argument_rules: list[ArgumentRule] = field(default_factory=list)
     rate_limits: list[RateLimit] = field(default_factory=list)
     scan_descriptions: Action = "block"
@@ -179,17 +183,29 @@ def policy_from_dict(data: dict[str, Any], base_dir: Path | None = None) -> Poli
             ArgumentRule(str(raw.get("tool", "*")), pattern, raw.get("arg"), raw.get("reason"))
         )
 
-    limits = []
+    limits: list[RateLimit] = []
+    request_limits: list[RateLimit] = []
     for i, raw in enumerate(data.get("rate_limits") or []):
+        _expect(isinstance(raw, dict), f"rate_limits[{i}] must be a mapping")
         _expect(
             "max_calls" in raw and "per_seconds" in raw,
             f"rate_limits[{i}] needs max_calls and per_seconds",
         )
         _expect(int(raw["max_calls"]) > 0, f"rate_limits[{i}].max_calls must be positive")
         _expect(float(raw["per_seconds"]) > 0, f"rate_limits[{i}].per_seconds must be positive")
-        limits.append(
-            RateLimit(str(raw.get("tool", "*")), int(raw["max_calls"]), float(raw["per_seconds"]))
+        _expect(
+            not ("tool" in raw and "server_request" in raw),
+            f"rate_limits[{i}] limits either a tool or a server_request, not both",
         )
+        target = raw.get("server_request", raw.get("tool", "*"))
+        limit = RateLimit(str(target), int(raw["max_calls"]), float(raw["per_seconds"]))
+        (request_limits if "server_request" in raw else limits).append(limit)
+
+    max_tokens = (data.get("server_requests") or {}).get("max_tokens")
+    _expect(
+        max_tokens is None or (isinstance(max_tokens, int) and max_tokens > 0),
+        f"server_requests.max_tokens must be a positive integer, got {max_tokens!r}",
+    )
 
     scan = data.get("scan") or {}
     redact = data.get("redact", {})
@@ -209,6 +225,8 @@ def policy_from_dict(data: dict[str, Any], base_dir: Path | None = None) -> Poli
         prompt_deny=prompt_deny,
         server_request_allow=server_request_allow,
         server_request_deny=server_request_deny,
+        server_request_limits=request_limits,
+        sampling_max_tokens=max_tokens,
         argument_rules=arg_rules,
         rate_limits=limits,
         scan_descriptions=_action(scan.get("descriptions"), "scan.descriptions", "block"),
