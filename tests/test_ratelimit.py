@@ -35,4 +35,27 @@ def test_denied_calls_do_not_consume_budget_of_other_limits():
     assert rl.check("write") is not None
     assert rl.check("write") is not None
     # Only the one allowed write was recorded against the shared budget.
-    assert len(rl._hits[(0, "*")]) == 1
+    assert len(rl._hits[(0, None, "*")]) == 1
+
+
+def test_per_client_limits_keep_a_budget_per_client():
+    rl = RateLimiter([RateLimit("*", 1, 60, per_client=True), RateLimit("*", 3, 60)], clock=Clock())
+    assert rl.check("a", "alice") is None
+    assert "for this client" in rl.check("a", "alice")
+    assert rl.check("a", "bob") is None
+    assert rl.check("a", "carol") is None
+    # The shared limit still caps everyone together.
+    assert "for this client" not in rl.check("a", "dave")
+
+
+def test_quiet_windows_are_swept():
+    from mcp_warden import ratelimit
+
+    clock = Clock()
+    rl = RateLimiter([RateLimit("*", 5, 60, per_client=True)], clock=clock)
+    for i in range(10):
+        rl.check("a", f"session-{i}")
+    clock.t = 120.0
+    for _ in range(ratelimit.SWEEP_EVERY):
+        rl.check("a", "live")
+    assert {k[1] for k in rl._hits} == {"live"}

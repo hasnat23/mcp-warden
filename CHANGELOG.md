@@ -48,6 +48,9 @@ All notable changes to this project are documented here. The format follows
 - Limits on server requests: `rate_limits` entries with `server_request: "sampling/*"`
   instead of `tool:`, and `server_requests.max_tokens` to cap `maxTokens` in sampling
   requests (the original is recorded as `max_tokens_requested`).
+- `per: client` on rate limits: in `serve`, a separate budget per named client (or per
+  session without auth) instead of one shared by everyone. Server requests such as sampling
+  are counted against, and audited with, the client they go to.
 
 ### Fixed
 - The single-server proxy now scans `resources/read` and `prompts/get` results for injected

@@ -31,6 +31,8 @@ class RateLimit:
     tool: str
     max_calls: int
     per_seconds: float
+    # A separate budget for each client of a shared gateway (user, else session).
+    per_client: bool = False
 
     @property
     def shared(self) -> bool:
@@ -197,8 +199,12 @@ def policy_from_dict(data: dict[str, Any], base_dir: Path | None = None) -> Poli
             not ("tool" in raw and "server_request" in raw),
             f"rate_limits[{i}] limits either a tool or a server_request, not both",
         )
+        per = raw.get("per", "all")
+        _expect(per in ("all", "client"), f"rate_limits[{i}].per must be all|client, got {per!r}")
         target = raw.get("server_request", raw.get("tool", "*"))
-        limit = RateLimit(str(target), int(raw["max_calls"]), float(raw["per_seconds"]))
+        limit = RateLimit(
+            str(target), int(raw["max_calls"]), float(raw["per_seconds"]), per == "client"
+        )
         (request_limits if "server_request" in raw else limits).append(limit)
 
     max_tokens = (data.get("server_requests") or {}).get("max_tokens")

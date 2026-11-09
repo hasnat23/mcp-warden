@@ -427,3 +427,38 @@ def test_server_requests_reach_the_calling_session(make_server):
     assert "from the call stream" in out[-1]["result"]["content"][0]["text"]
     assert len(streams[0].events) == 1  # nothing more on the GET stream
     assert streams[1].events == []  # bob is never asked
+
+
+def test_per_client_rate_limits(tmp_path):
+    from mcp_warden.policy import policy_from_dict
+    from mcp_warden.servers import ClientSpec, token_digest
+
+    policy = policy_from_dict(
+        {"rate_limits": [{"tool": "get_env", "max_calls": 1, "per_seconds": 60, "per": "client"}]}
+    )
+    spec = ServerSpec("local", policy, [sys.executable, str(FAKE_SERVER)])
+    server = GatewayServer(
+        [spec],
+        port=0,
+        clients=[ClientSpec("alice", token_digest("a")), ClientSpec("bob", token_digest("b"))],
+    )
+    server.start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def session(token):
+        client = StreamableHTTP(server.url, {"Authorization": f"Bearer {token}"})
+        rpc(client, INIT)
+        return client
+
+    def blocked(client, msg_id):
+        return rpc(client, call(msg_id, "local__get_env"))["result"].get("isError", False)
+
+    try:
+        alice = session("a")
+        assert not blocked(alice, 1)
+        assert blocked(alice, 2)
+        assert not blocked(session("b"), 3)  # bob has a separate budget
+        assert blocked(session("a"), 4)  # a new session does not reset alice's budget
+    finally:
+        server.shutdown()
+        server.close()
