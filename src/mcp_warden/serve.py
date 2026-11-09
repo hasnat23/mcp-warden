@@ -39,7 +39,7 @@ from urllib.parse import urlsplit
 from mcp_warden.gateway import Gateway, Message
 from mcp_warden.oauth import METADATA_PATH, InsufficientScope, InvalidToken, OAuthValidator
 from mcp_warden.servers import ClientSpec, ServerSpec, token_digest
-from mcp_warden.warden import AUDIT_CONTEXT, Sink
+from mcp_warden.warden import AUDIT_CONTEXT, CLIENT, Sink
 
 log = logging.getLogger("mcp_warden")
 
@@ -304,9 +304,11 @@ class GatewayServer:
 
         async def run() -> Message | None:
             token = AUDIT_CONTEXT.set(context)
+            who = CLIENT.set(f"user:{client.name}" if client and client.name else session)
             try:
                 return await self.gateway.handle(msg, scope=session, allowed=allowed)
             finally:
+                CLIENT.reset(who)
                 AUDIT_CONTEXT.reset(token)
 
         return asyncio.run_coroutine_threadsafe(run(), self._loop)

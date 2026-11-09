@@ -195,6 +195,7 @@ rate_limits:             # sliding window; a glob limit is one budget shared by 
   - { tool: "*", max_calls: 120, per_seconds: 60 }
   - { tool: "send_email", max_calls: 5, per_seconds: 3600 }
   - { server_request: "sampling/*", max_calls: 20, per_seconds: 3600 }   # the client's model
+  - { tool: "search_*", max_calls: 30, per_seconds: 60, per: client }     # a budget per client
 
 scan:
   descriptions: block    # block | warn | off
@@ -289,6 +290,8 @@ The `resources` and `prompts` allow and deny lists work like the tool lists, in 
 
 Resource subscriptions work through the gateway too, when a server offers them. `resources/subscribe` goes to the server that owns the URI, and each URI is subscribed upstream once however many clients ask. `notifications/resources/updated` reaches only the clients subscribed to that URI, over the standing `GET` stream in `serve`. The upstream subscription is dropped when the last client unsubscribes or its session ends. Subscribing to a denied URI, or to one on a server the client may not use, answers "resource not found".
 
+Rate limits are shared by every client of a server by default. A limit with `per: client` instead keeps a separate budget for each named client (its token or OAuth user, across all of its sessions) and, for anonymous access, for each session. Then one client cannot use up a tool for everyone. This works for tool calls and server requests alike.
+
 ### Sampling, elicitation and roots
 
 Servers can send requests back to the client: `sampling/createMessage` to use the client's model, `elicitation/create` to ask the user for input, and `roots/list`. A sampling prompt is server-written text going straight to a model, so it is as much an injection vector as a tool result. mcp-warden treats it the same way, in single-server and multi-server mode:
@@ -362,7 +365,7 @@ ruff check . && ruff format --check . && mypy
 
 ## Roadmap
 
-- Per-user limits in `serve`, so one client cannot use up a server's rate limits for everyone
+- Reload policies and the servers file in `serve` without a restart
 
 ## License
 

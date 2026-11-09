@@ -27,7 +27,7 @@ from mcp_warden.http_transport import StreamableHTTP, TransportError
 from mcp_warden.jsonrpc import decode, encode
 from mcp_warden.proxy import STREAM_LIMIT, _start_reader
 from mcp_warden.servers import SEP, ServerSpec
-from mcp_warden.warden import Sink, Warden
+from mcp_warden.warden import AUDIT_CONTEXT, CLIENT, Sink, Warden
 
 log = logging.getLogger("mcp_warden")
 
@@ -335,6 +335,8 @@ class Gateway:
         # (client scope, id the gateway gave a request it forwarded) -> its response
         self._forwarded: dict[tuple[str, str], asyncio.Future[Message]] = {}
         self._forward_ids = itertools.count(1)
+        # Each client's audit context and identity, for the requests servers send it.
+        self._contexts: dict[str, tuple[Any, str | None]] = {}
         self._started = False
         for spec in self.specs:
             path = spec.policy.audit_path
@@ -448,6 +450,8 @@ class Gateway:
             return None
         if not isinstance(msg, dict) or "method" not in msg:
             return None
+        if scope:
+            self._contexts[scope] = (AUDIT_CONTEXT.get(), CLIENT.get())
         method, params = msg["method"], msg.get("params") or {}
         if method == "notifications/cancelled":
             await self._cancel(params, scope)
@@ -664,6 +668,7 @@ class Gateway:
     async def forget(self, scope: str) -> None:
         """Release what a client held when its session ends."""
         self._client_caps.pop(scope, None)
+        self._contexts.pop(scope, None)
         for key in [k for k in self._forwarded if k[0] == scope]:
             self._forwarded.pop(key).cancel()
         await self._unsubscribe(None, scope)
@@ -686,10 +691,17 @@ class Gateway:
     async def _server_request(self, server: str, msg: Message, related: Any) -> Message:
         """Forward a server's request (sampling, elicitation, roots) to its client."""
         method, server_id = str(msg.get("method")), msg["id"]
-        forward, refusal = self.wardens[server].screen_server_request(msg)
+        scope = self._requester(server, related)
+        # Screen as the client it goes to: its limits, and its session in the audit.
+        context, who = self._contexts.get(scope or "", (None, None))
+        tokens = (AUDIT_CONTEXT.set(context), CLIENT.set(who))
+        try:
+            forward, refusal = self.wardens[server].screen_server_request(msg)
+        finally:
+            CLIENT.reset(tokens[1])
+            AUDIT_CONTEXT.reset(tokens[0])
         if refusal is not None:
             return refusal
-        scope = self._requester(server, related)
         if scope is None:
             return _error(server_id, -32603, f"mcp-warden: no single client to send {method} to")
         feature = CLIENT_FEATURES.get(method)

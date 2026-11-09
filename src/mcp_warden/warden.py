@@ -33,6 +33,8 @@ Sink = Callable[[dict[str, Any]], None]
 # Fields about the calling client (e.g. its HTTP session) added to audit records
 # emitted while handling that client's request.
 AUDIT_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar("mcp_warden_audit", default=None)
+# Who is calling, for per-client rate limits: the client's name, else its session.
+CLIENT: ContextVar[str | None] = ContextVar("mcp_warden_client", default=None)
 
 
 @dataclass
@@ -177,7 +179,7 @@ class Warden:
             self.hidden_tools.get(name)
             or self.policy.tool_allowed(name)
             or self.policy.check_arguments(name, arguments if isinstance(arguments, dict) else {})
-            or self.limiter.check(name)
+            or self.limiter.check(name, CLIENT.get())
         )
         if reason:
             enforce = self.policy.enforcing
@@ -380,7 +382,7 @@ class Warden:
         clamped = None
         if reason is None:
             # Counted only for requests that would otherwise go through.
-            reason = self.request_limiter.check(method)
+            reason = self.request_limiter.check(method, CLIENT.get())
         if reason is None and method == "sampling/createMessage":
             out, clamped = self._cap_tokens(out)
         decision = "allow" if reason is None else "deny" if self.policy.enforcing else "would_deny"

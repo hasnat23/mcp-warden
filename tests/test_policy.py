@@ -38,11 +38,15 @@ def test_server_request_limits():
             "rate_limits": [
                 {"tool": "*", "max_calls": 60, "per_seconds": 60},
                 {"server_request": "sampling/*", "max_calls": 5, "per_seconds": 3600},
+                {"tool": "search", "max_calls": 9, "per_seconds": 60, "per": "client"},
             ],
             "server_requests": {"max_tokens": 1000, "deny": ["elicitation/*"]},
         }
     )
-    assert [lim.tool for lim in p.rate_limits] == ["*"]
+    assert [(lim.tool, lim.per_client) for lim in p.rate_limits] == [
+        ("*", False),
+        ("search", True),
+    ]
     assert [(lim.tool, lim.max_calls) for lim in p.server_request_limits] == [("sampling/*", 5)]
     assert p.sampling_max_tokens == 1000 and p.server_request_deny == ["elicitation/*"]
 
@@ -91,6 +95,7 @@ def test_yaml_file_resolves_paths_relative_to_policy(tmp_path):
         {"resources": ["file:///*"]},
         {"rate_limits": [{"tool": "x", "server_request": "y", "max_calls": 1, "per_seconds": 1}]},
         {"server_requests": {"max_tokens": 0}},
+        {"rate_limits": [{"max_calls": 1, "per_seconds": 1, "per": "user"}]},
         {"server_requests": {"max_tokens": "lots"}},
         {"prompts": {"deny": "review"}},
     ],
