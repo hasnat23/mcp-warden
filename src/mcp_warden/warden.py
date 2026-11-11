@@ -127,16 +127,43 @@ class Warden:
         # Extra consumers of every audit record (e.g. OpenTelemetry). They see the
         # same redacted records as the log and must never break the proxy.
         self.sinks = list(sinks)
-        self.redactor = Redactor.build(policy.redact_extra)
-        self.limiter = RateLimiter(policy.rate_limits, clock=clock)
-        self.request_limiter = RateLimiter(policy.server_request_limits, clock=clock)
-        self.lock = Lockfile.load(policy.lockfile) if policy.lockfile else None
-        # Trust on first use: with no lockfile yet, the first listing becomes the pin.
-        self._tofu = self.lock is not None and not self.lock.exists
         self._clock = clock
+        self._apply(policy)
         self._pending: dict[str, _Pending] = {}
         self.hidden_tools: dict[str, str] = {}
         self.findings: list[Finding] = []
+
+    def _apply(self, policy: Policy, previous: Policy | None = None) -> None:
+        self.policy = policy
+        self.redactor = Redactor.build(policy.redact_extra)
+        # Rate limit windows survive a reload that leaves the limits as they were.
+        if previous is None or previous.rate_limits != policy.rate_limits:
+            self.limiter = RateLimiter(policy.rate_limits, clock=self._clock)
+        if previous is None or previous.server_request_limits != policy.server_request_limits:
+            self.request_limiter = RateLimiter(policy.server_request_limits, clock=self._clock)
+        self.lock = Lockfile.load(policy.lockfile) if policy.lockfile else None
+        # Trust on first use: with no lockfile yet, the first listing becomes the pin.
+        self._tofu = self.lock is not None and not self.lock.exists
+
+    def reload(self, policy: Policy) -> list[str]:
+        """Switch to a new policy; returns the settings that only a restart can change.
+
+        Tools hidden by the old policy stay hidden until the next ``tools/list``.
+        """
+        old = self.policy
+        self._apply(policy, old)
+        return [
+            name
+            for name, before, after in (
+                ("audit.path", old.audit_path, policy.audit_path),
+                (
+                    "telemetry",
+                    (old.otel, old.otel_service_name),
+                    (policy.otel, policy.otel_service_name),
+                ),
+            )
+            if before != after
+        ]
 
     # ------------------------------------------------------------------ client -> server
 

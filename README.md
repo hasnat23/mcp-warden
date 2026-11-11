@@ -354,6 +354,7 @@ mcp-warden serve --config servers.yaml --host 0.0.0.0 --port 8765 --token-env WA
 - Every audit record and span carries the caller's `remote` address and a short `session` id.
 - Upstreams start and their tools are listed once before the port opens, so a poisoned or drifted tool is hidden even from a client that calls it without listing first.
 - `GET /healthz` answers `{"status": "ok"}` for load balancers. Put TLS in front with your usual reverse proxy.
+- `kill -HUP <pid>` re-reads the servers file, policies and lockfiles without dropping connections. Each server's tools are listed again under the new policy, and clients are sent `list_changed` so they list them too. Sessions stay open unless their client was removed or its servers changed; those clients have to sign in again. A config that fails to load is logged and the running one is kept. Adding or removing a server, changing its command or URL, and the audit and telemetry settings still need a restart, and a reload logs which of them changed.
 
 ## Development
 
@@ -365,7 +366,7 @@ ruff check . && ruff format --check . && mypy
 
 ## Roadmap
 
-- Reload policies and the servers file in `serve` without a restart
+- Start and stop servers added to or removed from the servers file on reload
 
 ## License
 
