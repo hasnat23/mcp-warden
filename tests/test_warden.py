@@ -336,3 +336,16 @@ def test_monitor_mode_reports_token_cap_without_changing_the_request(tmp_path):
     out = w.from_server(sampling(1, "hi", max_tokens=5000)).to_client[0]
     assert out["params"]["maxTokens"] == 5000
     assert audit_events(tmp_path)[0]["max_tokens_requested"] == 5000
+
+
+def test_reload_keeps_unchanged_rate_limits_and_reports_restart_settings(tmp_path):
+    limits = {"rate_limits": [{"tool": "*", "max_calls": 1, "per_seconds": 60}]}
+    w = make(tmp_path, **limits)
+    assert w.from_client(call(1, "a")).to_server
+    notes = w.reload(policy_from_dict({**limits, "tools": {"deny": ["b"]}, "audit": {}}))
+    assert notes == ["audit.path"]
+    assert "rate limit" in w.from_client(call(2, "a")).to_client[0]["result"]["content"][0]["text"]
+    assert "deny rule" in w.from_client(call(3, "b")).to_client[0]["result"]["content"][0]["text"]
+
+    w.reload(policy_from_dict({"rate_limits": [{"tool": "*", "max_calls": 5, "per_seconds": 60}]}))
+    assert w.from_client(call(4, "a")).to_server  # new limits start a new window

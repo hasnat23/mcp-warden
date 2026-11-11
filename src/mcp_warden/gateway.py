@@ -393,6 +393,38 @@ class Gateway:
             if callable(closer):
                 closer()
 
+    async def reload(self, specs: Sequence[ServerSpec]) -> list[str]:
+        """Apply new policies to the running servers; returns what needs a restart.
+
+        Servers keep running. Adding or removing a server, or changing how one is
+        started, takes a restart; those changes are reported, not applied.
+        """
+        notes = []
+        new = {spec.name: spec for spec in specs}
+        for spec in self.specs:
+            if spec.name not in new:
+                notes.append(f"server {spec.name!r} was removed")
+        current = {spec.name: spec for spec in self.specs}
+        for name, spec in new.items():
+            old = current.get(name)
+            if old is None:
+                notes.append(f"server {name!r} was added")
+                continue
+            if (old.command, old.url, old.headers) != (spec.command, spec.url, spec.headers):
+                notes.append(f"server {name!r} changed how it is reached")
+            notes.extend(f"{name}: {s} changed" for s in self.wardens[name].reload(spec.policy))
+            current[name] = spec
+        self.specs = list(current.values())
+        # List again so the new policy and lockfile judge every tool before the next
+        # call, then tell clients their lists may have changed.
+        await self.list_tools()
+        for name in self.upstreams:
+            for method in LIST_CHANGED:
+                feature = method.split("/")[1]
+                if feature == "tools" or feature in self.upstreams[name].capabilities:
+                    self.deliver({"jsonrpc": "2.0", "method": method}, None, name)
+        return notes
+
     def _upstream_notification(self, server: str, msg: Message) -> None:
         # HTTP upstreams report from worker threads; deliver on the loop, in order.
         loop = self._loop

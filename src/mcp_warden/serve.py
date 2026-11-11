@@ -30,7 +30,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -89,11 +89,9 @@ class GatewayServer:
         self.host, self.port, self.path = host, port, path
         if token is not None and clients:
             raise ValueError("use a shared token or per-client tokens, not both")
-        self.clients = list(clients)
-        if token is not None:
-            self.clients.append(ClientSpec("", token_digest(token)))
-        self.oauth = oauth
-        self.auth_required = bool(self.clients) or oauth is not None
+        # The shared token comes from the command line and is kept across reloads.
+        self._token_client = ClientSpec("", token_digest(token)) if token is not None else None
+        self._set_auth(clients, oauth)
         self.allowed_origins = list(allowed_origins)
         self.request_timeout = request_timeout
         # session id -> the client that opened it
@@ -155,6 +153,30 @@ class GatewayServer:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
 
     # ------------------------------------------------------------------ sessions
+
+    def _set_auth(self, clients: Sequence[ClientSpec], oauth: OAuthValidator | None) -> None:
+        self.clients = list(clients) + ([self._token_client] if self._token_client else [])
+        self.oauth = oauth
+        self.auth_required = bool(self.clients) or oauth is not None
+
+    def reload(
+        self,
+        specs: Sequence[ServerSpec],
+        clients: Sequence[ClientSpec] = (),
+        oauth: OAuthValidator | None = None,
+    ) -> list[str]:
+        """Apply a new configuration without dropping connections.
+
+        Sessions stay open unless their client was removed or its access changed: a
+        session is bound to the client exactly as it was, so those clients sign in again.
+        Returns what only a restart can change.
+        """
+        if self._token_client is not None and (clients or oauth is not None):
+            raise ValueError("use a shared token or per-client tokens, not both")
+        notes: list[str] = self._run(self.gateway.reload(specs), timeout=None)
+        with self._sessions_lock:
+            self._set_auth(clients, oauth)
+        return notes
 
     def new_session(self, client: ClientSpec | None) -> str:
         sid = secrets.token_urlsafe(24)
@@ -539,7 +561,12 @@ class _Handler(BaseHTTPRequestHandler):
             owner.close_call_stream(sid, token)
 
 
-def run_server(server: GatewayServer) -> int:
+def run_server(
+    server: GatewayServer,
+    reload: Callable[[], tuple[list[ServerSpec], list[ClientSpec], OAuthValidator | None]]
+    | None = None,
+) -> int:
+    """Serve until SIGTERM or Ctrl-C; SIGHUP re-reads the configuration via ``reload``."""
     import signal
 
     server.start()
@@ -550,6 +577,13 @@ def run_server(server: GatewayServer) -> int:
     print(f"mcp-warden: serving {len(server.gateway.specs)} server(s) at {server.url}", flush=True)
     with contextlib.suppress(ValueError):  # not the main thread
         signal.signal(signal.SIGTERM, lambda *_: server.shutdown())
+        if reload is not None and hasattr(signal, "SIGHUP"):
+            signal.signal(
+                signal.SIGHUP,
+                lambda *_: threading.Thread(
+                    target=_reload, args=(server, reload), daemon=True
+                ).start(),
+            )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -557,3 +591,17 @@ def run_server(server: GatewayServer) -> int:
     finally:
         server.close()
     return 0
+
+
+def _reload(
+    server: GatewayServer,
+    load: Callable[[], tuple[list[ServerSpec], list[ClientSpec], OAuthValidator | None]],
+) -> None:
+    try:
+        notes = server.reload(*load())
+    except Exception as exc:
+        log.error("reload failed, keeping the current configuration: %s", exc)
+        return
+    for note in notes:
+        log.warning("reload: %s (takes a restart)", note)
+    log.info("reloaded the configuration")

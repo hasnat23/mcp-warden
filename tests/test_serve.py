@@ -462,3 +462,89 @@ def test_per_client_rate_limits(tmp_path):
     finally:
         server.shutdown()
         server.close()
+
+
+def test_reload_applies_new_policies_and_clients(tmp_path):
+    from mcp_warden.policy import policy_from_dict
+    from mcp_warden.servers import ClientSpec, token_digest
+
+    command = [sys.executable, str(FAKE_SERVER)]
+    alice, bob = ClientSpec("alice", token_digest("a")), ClientSpec("bob", token_digest("b"))
+    server = GatewayServer(
+        [ServerSpec("local", policy_from_dict({}), command)], port=0, clients=[alice, bob]
+    )
+    server.start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = StreamableHTTP(server.url, {"Authorization": "Bearer a"})
+        rpc(client, INIT)
+        stream = SSEReader(
+            server.url, {"Authorization": "Bearer a", "Mcp-Session-Id": client.session_id}
+        )
+        time.sleep(0.2)
+        assert not rpc(client, call(1, "local__get_env"))["result"]["isError"]
+
+        strict = policy_from_dict({"tools": {"deny": ["get_env"]}})
+        notes = server.reload([ServerSpec("local", strict, command)], [alice])
+        assert notes == []
+        # Same session, new policy; and the client is told to list tools again.
+        assert rpc(client, call(2, "local__get_env"))["result"]["isError"]
+        assert stream.wait_for(1)[0]["method"] == "notifications/tools/list_changed"
+        # bob was removed from the clients.
+        assert raw(server.url, body=INIT, headers={"Authorization": "Bearer b"})[0] == 401
+
+        renamed = ServerSpec("other", strict, command)
+        notes = server.reload([renamed], [alice])
+        assert notes == ["server 'local' was removed", "server 'other' was added"]
+    finally:
+        server.shutdown()
+        server.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="no SIGHUP on Windows")
+def test_sighup_reloads_the_config(tmp_path):
+    import signal
+    import socket
+    import subprocess
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    policy = tmp_path / "policy.yaml"
+    policy.write_text("{}\n")
+    config = tmp_path / "servers.yaml"
+    config.write_text(
+        f"policy: policy.yaml\nservers:\n  local:\n"
+        f"    command: [{json.dumps(sys.executable)}, {json.dumps(str(FAKE_SERVER))}]\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "mcp_warden", "serve", "--config", str(config), "--port", str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert "serving" in proc.stdout.readline()
+        client = StreamableHTTP(f"http://127.0.0.1:{port}/mcp")
+        rpc(client, INIT)
+        assert not rpc(client, call(1, "local__get_env"))["result"]["isError"]
+
+        policy.write_text("tools: {deny: [get_env]}\n")
+        proc.send_signal(signal.SIGHUP)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if rpc(client, call(2, "local__get_env"))["result"]["isError"]:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("the new policy was not applied")
+
+        # A broken config is refused and the running one kept.
+        policy.write_text("mode: yolo\n")
+        proc.send_signal(signal.SIGHUP)
+        time.sleep(0.5)
+        assert rpc(client, call(3, "local__get_env"))["result"]["isError"]
+    finally:
+        proc.terminate()
+        _, err = proc.communicate(timeout=10)
+    assert "reload failed" in err and "mode must be enforce|monitor" in err
