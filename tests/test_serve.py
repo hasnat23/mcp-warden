@@ -493,9 +493,20 @@ def test_reload_applies_new_policies_and_clients(tmp_path):
         # bob was removed from the clients.
         assert raw(server.url, body=INIT, headers={"Authorization": "Bearer b"})[0] == 401
 
-        renamed = ServerSpec("other", strict, command)
-        notes = server.reload([renamed], [alice])
-        assert notes == ["server 'local' was removed", "server 'other' was added"]
+        # Servers come and go: "other" starts, "local" stops, sessions carry on.
+        other = ServerSpec("other", policy_from_dict({}), command)
+        assert server.reload([other], [alice]) == []
+        assert set(server.gateway.upstreams) == {"other"}
+        assert not rpc(client, call(3, "other__get_env"))["result"]["isError"]
+        assert rpc(client, call(4, "local__get_env"))["error"]["code"] == -32602
+        tools = rpc(client, {"jsonrpc": "2.0", "id": 5, "method": "tools/list"})
+        assert {t["name"].split("__")[0] for t in tools["result"]["tools"]} == {"other"}
+
+        # A changed command restarts the server; a broken one is reported.
+        broken = ServerSpec("other", policy_from_dict({}), [sys.executable, "-c", "pass"])
+        assert server.reload([broken], [alice]) == ["server 'other' failed to start"]
+        assert server.reload([other], [alice]) == []
+        assert not rpc(client, call(6, "other__get_env"))["result"]["isError"]
     finally:
         server.shutdown()
         server.close()

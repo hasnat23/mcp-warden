@@ -436,6 +436,30 @@ async def test_gateway_forwards_server_requests_to_the_calling_client(tmp_path):
         await gateway.close()
 
 
+async def test_reload_forgets_removed_servers(tmp_path):
+    from mcp_warden.gateway import Gateway
+
+    specs = load_servers(resource_servers_config(tmp_path))
+    gateway = Gateway(specs)
+    changed = []
+    gateway.deliver = lambda msg, scope, server: changed.append((server, msg["method"]))
+    try:
+        await gateway.handle({**INIT[0], "id": 0})
+        await gateway.list_resources()
+        sub = rpc_msg(1, "resources/subscribe", uri="memo://a/notes")
+        assert (await gateway.handle(sub, "s1"))["result"] == {}
+
+        assert await gateway.reload([s for s in specs if s.name != "a"]) == []
+        assert "a" not in gateway.upstreams and gateway._subscriptions == {}
+        read = await gateway.handle(rpc_msg(2, "resources/read", uri="memo://a/notes"))
+        assert read["error"]["code"] == -32002
+        assert ("a", "notifications/tools/list_changed") in changed
+        servers = {t["name"].split("__")[0] for t in await gateway.list_tools()}
+        assert servers == {"b", "plain"}
+    finally:
+        await gateway.close()
+
+
 def test_template_regex():
     from mcp_warden.gateway import template_regex
 
