@@ -338,24 +338,50 @@ class Gateway:
         # Each client's audit context and identity, for the requests servers send it.
         self._contexts: dict[str, tuple[Any, str | None]] = {}
         self._started = False
+        # The client features offered to upstreams, fixed when they first start.
+        self._offered: Message = {}
         for spec in self.specs:
-            path = spec.policy.audit_path
-            if path not in self._audits:
-                self._audits[path] = AuditLog(path)
-            self.wardens[spec.name] = Warden(
-                spec.policy, audit=self._audits[path], sinks=self.sinks, label=spec.name
+            self._add(spec)
+
+    def _add(self, spec: ServerSpec) -> Upstream:
+        path = spec.policy.audit_path
+        if path not in self._audits:
+            self._audits[path] = AuditLog(path)
+        self.wardens[spec.name] = Warden(
+            spec.policy, audit=self._audits[path], sinks=self.sinks, label=spec.name
+        )
+        upstream: Upstream
+        if spec.url:
+            upstream = HttpUpstream(
+                spec.name,
+                StreamableHTTP(spec.url, spec.headers),
+                self._upstream_notification,
+                self._server_request,
             )
-            if spec.url:
-                self.upstreams[spec.name] = HttpUpstream(
-                    spec.name,
-                    StreamableHTTP(spec.url, spec.headers),
-                    self._upstream_notification,
-                    self._server_request,
-                )
-            else:
-                self.upstreams[spec.name] = StdioUpstream(
-                    spec.name, spec.command, self._upstream_notification, self._server_request
-                )
+        else:
+            upstream = StdioUpstream(
+                spec.name, spec.command, self._upstream_notification, self._server_request
+            )
+        upstream.client_capabilities = self._offered
+        self.upstreams[spec.name] = upstream
+        return upstream
+
+    async def _remove(self, name: str) -> None:
+        """Stop a server and forget everything routed to it; its calls in flight fail."""
+        upstream = self.upstreams.pop(name)
+        warden = self.wardens.pop(name)
+        self._resource_uris.pop(name, None)
+        self._templates.pop(name, None)
+        for key in [k for k in self._subscriptions if k[0] == name]:
+            del self._subscriptions[key]
+        try:
+            await upstream.close()
+        except Exception as exc:
+            log.warning("%s: stopping failed: %s", name, exc)
+        path = warden.policy.audit_path
+        if not any(w.audit is warden.audit for w in self.wardens.values()):
+            self._audits.pop(path, None)
+            warden.audit.close()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -375,6 +401,7 @@ class Gateway:
         offered: Message = {f: {} for f in sorted(features)}
         if "roots" in offered and self.default_scope is not None:
             offered["roots"] = {"listChanged": True}  # passed on from the one client
+        self._offered = offered
         for upstream in self.upstreams.values():
             upstream.client_capabilities = offered
         results = await asyncio.gather(
@@ -394,34 +421,52 @@ class Gateway:
                 closer()
 
     async def reload(self, specs: Sequence[ServerSpec]) -> list[str]:
-        """Apply new policies to the running servers; returns what needs a restart.
+        """Switch to new server specs and policies; returns what needs a restart.
 
-        Servers keep running. Adding or removing a server, or changing how one is
-        started, takes a restart; those changes are reported, not applied.
+        Unchanged servers keep running under their new policy. Added servers are
+        started, removed ones stopped, and a server whose command, URL or headers
+        changed is restarted. Only audit and telemetry settings take a restart.
         """
-        notes = []
+        notes: list[str] = []
         new = {spec.name: spec for spec in specs}
-        for spec in self.specs:
-            if spec.name not in new:
-                notes.append(f"server {spec.name!r} was removed")
         current = {spec.name: spec for spec in self.specs}
+        removed = [name for name in current if name not in new]
+        for name in removed:
+            log.info("reload: stopping server %s", name)
+            await self._remove(name)
+        starting = []
         for name, spec in new.items():
             old = current.get(name)
-            if old is None:
-                notes.append(f"server {name!r} was added")
+            if old is not None and (old.command, old.url, old.headers) == (
+                spec.command,
+                spec.url,
+                spec.headers,
+            ):
+                notes.extend(f"{name}: {s} changed" for s in self.wardens[name].reload(spec.policy))
                 continue
-            if (old.command, old.url, old.headers) != (spec.command, spec.url, spec.headers):
-                notes.append(f"server {name!r} changed how it is reached")
-            notes.extend(f"{name}: {s} changed" for s in self.wardens[name].reload(spec.policy))
-            current[name] = spec
-        self.specs = list(current.values())
-        # List again so the new policy and lockfile judge every tool before the next
+            if old is not None:
+                log.info("reload: restarting server %s", name)
+                await self._remove(name)
+            else:
+                log.info("reload: starting server %s", name)
+            starting.append((name, self._add(spec)))
+        self.specs = list(specs)
+        if self._started:
+            results = await asyncio.gather(
+                *(u.start() for _, u in starting), return_exceptions=True
+            )
+            for (name, _), result in zip(starting, results, strict=True):
+                if isinstance(result, BaseException):
+                    log.error("server %s failed to start: %s", name, result)
+                    notes.append(f"server {name!r} failed to start")
+        # List again so the new policies and lockfiles judge every tool before the next
         # call, then tell clients their lists may have changed.
         await self.list_tools()
-        for name in self.upstreams:
+        for name in [*self.upstreams, *removed]:
+            caps = self.upstreams[name].capabilities if name in self.upstreams else {}
             for method in LIST_CHANGED:
                 feature = method.split("/")[1]
-                if feature == "tools" or feature in self.upstreams[name].capabilities:
+                if feature == "tools" or feature in caps or name in removed:
                     self.deliver({"jsonrpc": "2.0", "method": method}, None, name)
         return notes
 

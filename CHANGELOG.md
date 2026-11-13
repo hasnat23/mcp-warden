@@ -54,6 +54,8 @@ All notable changes to this project are documented here. The format follows
 - `serve` reloads on `SIGHUP`: policies, lockfiles, `clients` and `oauth` are re-read
   without dropping connections, tools are re-listed under the new policy and clients get
   `list_changed`. A config that fails to load keeps the running one.
+- Reloads start servers added to the servers file, stop removed ones and restart those whose
+  command, URL or headers changed, without dropping client sessions.
 
 ### Fixed
 - The single-server proxy now scans `resources/read` and `prompts/get` results for injected
