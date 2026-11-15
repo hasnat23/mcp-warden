@@ -559,3 +559,29 @@ def test_sighup_reloads_the_config(tmp_path):
         proc.terminate()
         _, err = proc.communicate(timeout=10)
     assert "reload failed" in err and "mode must be enforce|monitor" in err
+
+
+def test_metrics_endpoint(make_server):
+    server = make_server(token="t", metrics=True)
+    auth = {"Authorization": "Bearer t"}
+    client = StreamableHTTP(server.url, auth)
+    rpc(client, INIT)
+    rpc(client, call(1, "local__get_env"))
+    metrics_url = server.url.replace("/mcp", "/metrics")
+    with pytest.raises(urllib.error.HTTPError) as err:
+        urllib.request.urlopen(metrics_url, timeout=10)
+    assert err.value.code == 401
+    req = urllib.request.Request(metrics_url, headers=auth)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        assert resp.headers["Content-Type"].startswith("text/plain; version=0.0.4")
+        text = resp.read().decode()
+    calls = 'mcp_warden_tool_calls_total{server="local",tool="get_env",decision="allow"} 1'
+    assert calls in text
+    assert 'mcp_warden_hidden_tools_total{server="shady"} 1' in text  # the poisoned tool
+    assert 'mcp_warden_redactions_total{server="local"} 1' in text
+    assert "mcp_warden_sessions 1" in text and "mcp_warden_servers 2" in text
+
+
+def test_metrics_are_off_by_default(make_server):
+    server = make_server()
+    assert raw(server.url.replace("/mcp", "/metrics"), method="GET")[0] == 404

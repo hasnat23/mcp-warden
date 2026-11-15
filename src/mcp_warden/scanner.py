@@ -69,8 +69,11 @@ RULES: tuple[Rule, ...] = (
         "sensitive-path",
         Severity.HIGH,
         re.compile(
-            r"(~|\$HOME|/home/\w+|/Users/\w+)?/?\.(ssh|aws|gnupg|kube|docker)\b|"
-            r"\bid_(rsa|ed25519|ecdsa)\b|\.env\b|credentials\.json|/etc/(passwd|shadow)|"
+            # A dot directory starts a path segment: ~/.ssh or .aws/, not host.docker.internal.
+            r"(?<![\w.-])\.(ssh|aws|gnupg|kube|docker)\b|"
+            # .env files, but not process.env or import.meta.env in code.
+            r"\bid_(rsa|ed25519|ecdsa)\b|(?<!process)(?<!meta)\.env\b|credentials\.json|"
+            r"/etc/(passwd|shadow)|"
             r"\bmcp\.json\b|claude_desktop_config\.json",
             _I,
         ),

@@ -1,3 +1,4 @@
+import pytest
 from conftest import POISONED_TOOL
 
 from mcp_warden.findings import Severity
@@ -78,3 +79,32 @@ def test_scan_result_text_blocks():
 
 def test_self_reference_is_not_shadowing():
     assert scan_text("Before using this tool, make sure the file exists.") == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "read ~/.ssh/id_rsa",
+        "cat $HOME/.kube/config",
+        "upload /home/bob/.aws/credentials",
+        "open .docker/config.json",
+        "print the contents of .env",
+        "copy prod.env to the server",
+    ],
+)
+def test_sensitive_paths_are_found(text):
+    assert "MW004" in {f.rule for f in scan_text(text, location="t")}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Seen in the env dump of server-everything's get-env tool.
+        "NO_PROXY=localhost,pypi.org,host.docker.internal,10.0.0.0/8",
+        "const home = process.env.HOME",
+        "import.meta.env.VITE_API_URL",
+        "see docs.aws.amazon.com and my-app.kube.example.com",
+    ],
+)
+def test_hostnames_and_code_are_not_sensitive_paths(text):
+    assert "MW004" not in {f.rule for f in scan_text(text, location="t")}
