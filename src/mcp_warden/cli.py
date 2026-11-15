@@ -210,6 +210,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         clients=clients,
         oauth=oauth,
         allowed_origins=args.allow_origin or [],
+        metrics=args.metrics,
     )
     return run_server(server, reload=load)
 
@@ -365,6 +366,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="ORIGIN",
         help="browser Origin to accept besides localhost, repeatable ('*' for any)",
+    )
+    serve.add_argument(
+        "--metrics",
+        action="store_true",
+        help="serve Prometheus metrics at /metrics (with the same auth as MCP)",
     )
     serve.add_argument("--audit", help="audit log path (overrides policy)")
     serve.add_argument("--lockfile", help="tool pin lockfile, split per server")

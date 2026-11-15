@@ -56,8 +56,14 @@ All notable changes to this project are documented here. The format follows
   `list_changed`. A config that fails to load keeps the running one.
 - Reloads start servers added to the servers file, stop removed ones and restart those whose
   command, URL or headers changed, without dropping client sessions.
+- `serve --metrics`: a Prometheus `/metrics` endpoint (same auth as MCP) with tool calls
+  by decision, server requests, hidden tools, redactions, findings by rule, a latency
+  histogram and open sessions.
 
 ### Fixed
+- MW004 no longer flags hostnames such as `host.docker.internal` or `docs.aws.amazon.com`, nor
+  `process.env` and `import.meta.env` in code. With `scan.results: block` it withheld
+  harmless results, such as the environment dump of the reference `everything` server.
 - The single-server proxy now scans `resources/read` and `prompts/get` results for injected
   instructions like tool results, instead of only redacting them.
 - Cancelled tool calls (`notifications/cancelled`) are audited and no longer leak pending

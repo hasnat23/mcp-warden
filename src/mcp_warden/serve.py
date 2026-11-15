@@ -37,6 +37,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from mcp_warden.gateway import Gateway, Message
+from mcp_warden.metrics import CONTENT_TYPE, MetricsSink
 from mcp_warden.oauth import METADATA_PATH, InsufficientScope, InvalidToken, OAuthValidator
 from mcp_warden.servers import ClientSpec, ServerSpec, token_digest
 from mcp_warden.warden import AUDIT_CONTEXT, CLIENT, Sink
@@ -81,7 +82,20 @@ class GatewayServer:
         oauth: OAuthValidator | None = None,
         allowed_origins: Sequence[str] = (),
         request_timeout: float = 300.0,
+        metrics: bool = False,
     ):
+        self.metrics: MetricsSink | None = None
+        if metrics:
+            self.metrics = MetricsSink(
+                {
+                    "mcp_warden_sessions": ("Open client sessions.", lambda: len(self.sessions)),
+                    "mcp_warden_servers": (
+                        "Upstream servers configured.",
+                        lambda: len(self.gateway.upstreams),
+                    ),
+                }
+            )
+            sinks = [*sinks, self.metrics]
         self.gateway = Gateway(specs, sinks=sinks)
         self.gateway.deliver = self._deliver
         self.gateway.default_scope = None  # several clients: a request needs its call
@@ -382,6 +396,20 @@ class _Handler(BaseHTTPRequestHandler):
 
     client: ClientSpec | None = None
 
+    def _metrics(self, sink: MetricsSink) -> None:
+        """Prometheus scrape; needs the same credentials as MCP when auth is on."""
+        try:
+            self.owner.authenticate(self.headers.get("Authorization"))
+        except AuthError as exc:
+            self._send(exc.status, headers={"WWW-Authenticate": exc.challenge})
+            return
+        data = sink.render().encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", CONTENT_TYPE)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _guard(self) -> bool:
         """Path, Origin and auth checks shared by every MCP method."""
         if urlsplit(self.path).path != self.owner.path:
@@ -439,6 +467,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/healthz":
             self._send(200, {"status": "ok"})
+            return
+        if path == "/metrics" and self.owner.metrics is not None:
+            self._metrics(self.owner.metrics)
             return
         if not self._guard():
             return
