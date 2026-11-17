@@ -354,7 +354,7 @@ mcp-warden serve --config servers.yaml --host 0.0.0.0 --port 8765 --token-env WA
 - Every audit record and span carries the caller's `remote` address and a short `session` id.
 - Upstreams start and their tools are listed once before the port opens, so a poisoned or drifted tool is hidden even from a client that calls it without listing first.
 - `GET /healthz` answers `{"status": "ok"}` for load balancers. Put TLS in front with your usual reverse proxy.
-- `--metrics` serves Prometheus metrics at `/metrics`, behind the same token or OAuth check as MCP: tool calls by server, tool, decision and named client (`mcp_warden_tool_calls_total`), resource reads, prompt gets and server requests (`mcp_warden_requests_total`), hidden tools, redactions, scanner findings by rule, a tool-call latency histogram, and open sessions. They come from the same redacted records as the audit log, and need no extra dependency.
+- `--metrics` serves Prometheus metrics at `/metrics`, behind the same token or OAuth check as MCP: tool calls by server, tool, decision and named client (`mcp_warden_tool_calls_total`), resource reads, prompt gets and server requests (`mcp_warden_requests_total`), hidden tools, redactions, scanner findings by rule, a tool-call latency histogram, and open sessions. They come from the same redacted records as the audit log, and need no extra dependency. [`examples/grafana/mcp-warden.json`](examples/grafana/mcp-warden.json) is a Grafana dashboard for them (Dashboards → New → Import). It shows calls by decision, latency percentiles, the most denied tools, calls per client, findings by rule, redactions and server requests, filterable by server.
 - `kill -HUP <pid>` re-reads the servers file, policies and lockfiles without dropping connections. Each server's tools are listed again under the new policy, and clients are sent `list_changed` so they list them too. Sessions stay open unless their client was removed or its servers changed; those clients have to sign in again. A config that fails to load is logged and the running one is kept. Servers added to the file are started and removed ones stopped (their calls in flight fail), and a server whose command, URL or headers changed is restarted. Only the audit and telemetry settings need a restart, and a reload logs when they changed.
 
 ## Development
@@ -367,7 +367,7 @@ ruff check . && ruff format --check . && mypy
 
 ## Roadmap
 
-- A Grafana dashboard for the `/metrics` endpoint
+- Audit upstream errors on resource reads and prompt gets, as tool calls already are
 
 ## License
 
