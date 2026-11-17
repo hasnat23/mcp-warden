@@ -63,6 +63,9 @@ All notable changes to this project are documented here. The format follows
   queries metrics and labels mcp-warden exports.
 
 ### Fixed
+- `serve` reads the body of a request it rejects (401, 403, 404) before answering. The
+  unread bytes were parsed as the next request on a keep-alive connection, and on Windows
+  the client saw the connection reset instead of the 401.
 - MW004 no longer flags hostnames such as `host.docker.internal` or `docs.aws.amazon.com`, nor
   `process.env` and `import.meta.env` in code. With `scan.results: block` it withheld
   harmless results, such as the environment dump of the reference `everything` server.

@@ -585,3 +585,26 @@ def test_metrics_endpoint(make_server):
 def test_metrics_are_off_by_default(make_server):
     server = make_server()
     assert raw(server.url.replace("/mcp", "/metrics"), method="GET")[0] == 404
+
+
+def test_rejected_requests_leave_the_connection_usable(make_server):
+    """A 401 must still consume the body; unread bytes would corrupt the next request
+    on a keep-alive connection, and Windows resets the connection outright."""
+    import http.client
+    from urllib.parse import urlsplit
+
+    server = make_server(token="t")
+    url = urlsplit(server.url)
+    conn = http.client.HTTPConnection(url.hostname, url.port, timeout=10)
+    body = json.dumps(INIT)
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    try:
+        conn.request("POST", url.path, body, headers)
+        first = conn.getresponse()
+        first.read()
+        assert first.status == 401
+        conn.request("POST", url.path, body, {**headers, "Authorization": "Bearer t"})
+        second = conn.getresponse()
+        assert second.status == 200 and json.loads(second.read())["id"] == 0
+    finally:
+        conn.close()
