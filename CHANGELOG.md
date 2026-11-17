@@ -59,6 +59,8 @@ All notable changes to this project are documented here. The format follows
 - `serve --metrics`: a Prometheus `/metrics` endpoint (same auth as MCP) with tool calls
   by decision, server requests, hidden tools, redactions, findings by rule, a latency
   histogram and open sessions.
+- A Grafana dashboard for those metrics in `examples/grafana/`, with a test that it only
+  queries metrics and labels mcp-warden exports.
 
 ### Fixed
 - MW004 no longer flags hostnames such as `host.docker.internal` or `docs.aws.amazon.com`, nor
