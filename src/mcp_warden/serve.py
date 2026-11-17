@@ -413,18 +413,37 @@ class _Handler(BaseHTTPRequestHandler):
     def _guard(self) -> bool:
         """Path, Origin and auth checks shared by every MCP method."""
         if urlsplit(self.path).path != self.owner.path:
+            self._drain()
             self._send(404, _rpc_error(-32600, "not found"))
             return False
         if not origin_allowed(self.headers.get("Origin"), self.owner.allowed_origins):
+            self._drain()
             self._send(403, _rpc_error(-32600, "origin not allowed"))
             return False
         try:
             self.client = self.owner.authenticate(self.headers.get("Authorization"))
         except AuthError as exc:
+            self._drain()
             message = "insufficient scope" if exc.status == 403 else "unauthorized"
             self._send(exc.status, _rpc_error(-32600, message), {"WWW-Authenticate": exc.challenge})
             return False
         return True
+
+    def _drain(self) -> None:
+        """Consume the body of a request answered without reading it.
+
+        Unread bytes would be parsed as the next request on a keep-alive connection,
+        and Windows resets a connection closed with data still unread. A body too
+        large to be worth reading closes the connection instead.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if 0 < length <= MAX_BODY:
+            self.rfile.read(length)
+        elif length:
+            self.close_connection = True
 
     def _accepts_sse(self) -> bool:
         return "text/event-stream" in self.headers.get("Accept", "")
