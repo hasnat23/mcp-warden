@@ -261,9 +261,10 @@ def test_gateway_resources_and_prompts(tmp_path):
     reads = {r["uri"]: r for r in records if r["event"] == "resource_read"}
     assert reads["memo://b/secrets"]["server"] == "b" and reads["memo://b/secrets"]["redactions"]
     assert reads["memo://b/evil"]["blocked"] and not reads["memo://a/evil"]["blocked"]
-    prompts = [r for r in records if r["event"] == "prompt_get"]
-    assert [(r["prompt"], "error" in r) for r in prompts] == [("review", False), ("missing", True)]
-    assert prompts[1]["error"]["code"] == -32602 and prompts[1]["server"] == "b"
+    # Requests run concurrently, so records can land in any order.
+    prompts = {r["prompt"]: r for r in records if r["event"] == "prompt_get"}
+    assert set(prompts) == {"review", "missing"} and "error" not in prompts["review"]
+    assert prompts["missing"]["error"]["code"] == -32602 and prompts["missing"]["server"] == "b"
     assert replies[12]["error"]["code"] == -32602
     # An unlisted URI is tried on each server; only the final "not found" is audited.
     misses = [r for r in records if r.get("uri") == "memo://zzz/x"]
