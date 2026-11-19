@@ -102,6 +102,8 @@ def resources_method(method, params):
     if method == "prompts/list":
         return {"prompts": [{"name": "review", "arguments": [{"name": "code"}]}]}
     if method == "prompts/get":
+        if params.get("name") != "review":
+            return {"_error": {"code": -32602, "message": f"unknown prompt: {params.get('name')}"}}
         code = (params.get("arguments") or {}).get("code", "")
         text = f"[{tag}] review {code} with token ghp_" + "c" * 36
         return {"messages": [{"role": "user", "content": {"type": "text", "text": text}}]}

@@ -252,14 +252,21 @@ class Warden:
             return Outcome(to_client=[self._on_tools_list(msg)])
         if pending.method == "tools/call":
             return Outcome(to_client=[self._on_tool_result(msg, pending)])
+        target = pending.tool or ""
+        latency_ms = round((self._clock() - pending.started) * 1000, 2)
+        if "error" in msg and "result" not in msg:
+            if pending.method == "resources/read":
+                self.failed_resource(target, msg["error"], latency_ms=latency_ms)
+            elif pending.method == "prompts/get":
+                self.failed_prompt(target, msg["error"], latency_ms=latency_ms)
+            return Outcome(to_client=[msg])
         result = msg.get("result")
         if not isinstance(result, dict):
             return Outcome(to_client=[msg])
-        target = pending.tool or ""
         if pending.method == "resources/read":
-            result = self.filter_resource(target, result)
+            result = self.filter_resource(target, result, latency_ms=latency_ms)
         elif pending.method == "prompts/get":
-            result = self.filter_prompt(target, result)
+            result = self.filter_prompt(target, result, latency_ms=latency_ms)
         elif pending.method == "resources/list":
             result = {**result, "resources": self.visible_resources(result.get("resources"))}
         elif pending.method == "prompts/list":
@@ -334,7 +341,11 @@ class Warden:
         name = pending.tool or ""
         if "result" not in msg:
             self._audit_call(
-                name, pending.arguments, "allow", latency_ms=latency_ms, error=msg.get("error")
+                name,
+                pending.arguments,
+                "allow",
+                latency_ms=latency_ms,
+                error=self._redact_error(msg.get("error")),
             )
             return msg
 
@@ -486,7 +497,25 @@ class Warden:
         log.warning("%s %s: %s", "denied" if self.policy.enforcing else "would deny", event, reason)
         self._emit(event, decision=decision, reason=reason, **fields)
 
-    def filter_resource(self, uri: str, result: Any) -> Any:
+    def failed_resource(self, uri: str, error: Any, latency_ms: float | None = None) -> None:
+        """Audit a ``resources/read`` the server answered with an error."""
+        self._emit("resource_read", uri=uri, decision="allow", **self._failure(error, latency_ms))
+
+    def failed_prompt(self, name: str, error: Any, latency_ms: float | None = None) -> None:
+        """Audit a ``prompts/get`` the server answered with an error."""
+        self._emit("prompt_get", prompt=name, decision="allow", **self._failure(error, latency_ms))
+
+    def _failure(self, error: Any, latency_ms: float | None) -> dict[str, Any]:
+        fields: dict[str, Any] = {"error": self._redact_error(error)}
+        if latency_ms is not None:
+            fields["latency_ms"] = latency_ms
+        return fields
+
+    def _redact_error(self, error: Any) -> Any:
+        """Error messages can echo what was asked for, so they are redacted like results."""
+        return self.redactor.redact(error)[0] if self.policy.redact else error
+
+    def filter_resource(self, uri: str, result: Any, latency_ms: float | None = None) -> Any:
         """Redact and scan a ``resources/read`` result, which goes straight to the model."""
 
         def blocks(r: Any) -> list[tuple[str, Any]]:
@@ -496,10 +525,12 @@ class Warden:
         out, record = self._screen(result, blocks)
         if record["blocked"]:
             out = blocked_resource(uri, record["reason"])
+        if latency_ms is not None:
+            record["latency_ms"] = latency_ms
         self._emit("resource_read", uri=uri, decision="allow", **record)
         return out
 
-    def filter_prompt(self, name: str, result: Any) -> Any:
+    def filter_prompt(self, name: str, result: Any, latency_ms: float | None = None) -> Any:
         """Redact and scan a ``prompts/get`` result before it enters the conversation."""
 
         def blocks(r: Any) -> list[tuple[str, Any]]:
@@ -513,6 +544,8 @@ class Warden:
         out, record = self._screen(result, blocks)
         if record["blocked"]:
             out = blocked_prompt(record["reason"])
+        if latency_ms is not None:
+            record["latency_ms"] = latency_ms
         self._emit("prompt_get", prompt=name, decision="allow", **record)
         return out
 

@@ -284,7 +284,7 @@ servers:
 { "mcpServers": { "warden": { "command": "mcp-warden", "args": ["run", "--config", "servers.yaml"] } } }
 ```
 
-Prompts are exposed as `<server>__<prompt>` too. Resources keep their URIs, and `resources/read` goes to the server that listed the URI or whose URI template matches it (or to each server in turn, for a URI nobody has listed yet). Resource contents and prompt messages get the same treatment as tool results: secrets are redacted and the text is scanned for injected instructions, withheld when `scan.results` is `block`, and recorded as `resource_read` and `prompt_get` audit events.
+Prompts are exposed as `<server>__<prompt>` too. Resources keep their URIs, and `resources/read` goes to the server that listed the URI or whose URI template matches it (or to each server in turn, for a URI nobody has listed yet). Resource contents and prompt messages get the same treatment as tool results: secrets are redacted and the text is scanned for injected instructions, withheld when `scan.results` is `block`, and recorded as `resource_read` and `prompt_get` audit events, with the latency and any error the server answered with.
 
 The `resources` and `prompts` allow and deny lists work like the tool lists, in single-server and multi-server mode alike: denied resources and prompts are left out of listings, and reading or getting one returns a "Blocked by mcp-warden" message without the request reaching the server. In monitor mode both are only recorded, with `decision: would_deny`. URI templates stay listed, since a template can expand to allowed and denied URIs; the rules apply to each concrete URI read through them.
 
@@ -364,10 +364,6 @@ uv venv && uv pip install -e '.[dev]'
 pytest            # unit tests plus end-to-end tests over real stdio subprocesses
 ruff check . && ruff format --check . && mypy
 ```
-
-## Roadmap
-
-- Audit upstream errors on resource reads and prompt gets, as tool calls already are
 
 ## License
 

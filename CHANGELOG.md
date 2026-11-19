@@ -61,8 +61,13 @@ All notable changes to this project are documented here. The format follows
   histogram and open sessions.
 - A Grafana dashboard for those metrics in `examples/grafana/`, with a test that it only
   queries metrics and labels mcp-warden exports.
+- `resource_read` and `prompt_get` audit records carry `latency_ms`, and a read or prompt the
+  server answers with an error is audited with that `error`, as tool calls are. Metrics count
+  it under `decision="error"`.
 
 ### Fixed
+- Error messages in audit records are redacted like results, since a server can echo the
+  secret it was asked for back in the error.
 - `serve` reads the body of a request it rejects (401, 403, 404) before answering. The
   unread bytes were parsed as the next request on a keep-alive connection, and on Windows
   the client saw the connection reset instead of the 401.
