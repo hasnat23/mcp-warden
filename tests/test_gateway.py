@@ -226,6 +226,7 @@ def test_gateway_resources_and_prompts(tmp_path):
         rpc_msg(9, "resources/read", uri="memo://zzz/x"),
         rpc_msg(10, "prompts/get", name="a__review", arguments={"code": "x.py"}),
         rpc_msg(11, "prompts/get", name="plain__review"),
+        rpc_msg(12, "prompts/get", name="b__missing"),
     ]
     proc = subprocess.run(
         [*WARDEN, "run", "--config", str(cfg)],
@@ -260,7 +261,14 @@ def test_gateway_resources_and_prompts(tmp_path):
     reads = {r["uri"]: r for r in records if r["event"] == "resource_read"}
     assert reads["memo://b/secrets"]["server"] == "b" and reads["memo://b/secrets"]["redactions"]
     assert reads["memo://b/evil"]["blocked"] and not reads["memo://a/evil"]["blocked"]
-    assert [r["prompt"] for r in records if r["event"] == "prompt_get"] == ["review"]
+    prompts = [r for r in records if r["event"] == "prompt_get"]
+    assert [(r["prompt"], "error" in r) for r in prompts] == [("review", False), ("missing", True)]
+    assert prompts[1]["error"]["code"] == -32602 and prompts[1]["server"] == "b"
+    assert replies[12]["error"]["code"] == -32602
+    # An unlisted URI is tried on each server; only the final "not found" is audited.
+    misses = [r for r in records if r.get("uri") == "memo://zzz/x"]
+    assert len(misses) == 1 and misses[0]["error"]["code"] == -32002
+    assert all(isinstance(r["latency_ms"], float) for r in records if r["event"] == "resource_read")
 
 
 async def test_gateway_scopes_resources_and_prompts_per_client(tmp_path):

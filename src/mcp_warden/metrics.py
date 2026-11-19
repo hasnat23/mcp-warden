@@ -72,6 +72,8 @@ class MetricsSink:
                 decision = str(record.get("decision", ""))
                 if record.get("blocked"):
                     decision = "content_blocked"
+                elif record.get("error"):
+                    decision = "error"
                 labels = (*base, ("method", method), ("decision", decision))
                 self._counters["mcp_warden_requests_total"][labels] += 1
             elif event == "tools_list":

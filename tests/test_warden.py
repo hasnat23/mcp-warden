@@ -256,6 +256,29 @@ def test_single_server_resource_reads_are_redacted_and_scanned(tmp_path):
     assert events[1]["event"] == "prompt_get" and events[1]["blocked"]
 
 
+def test_upstream_errors_on_reads_and_prompt_gets_are_audited(tmp_path):
+    clock = iter([0.0, 0.25, 1.0, 1.5])
+    w = Warden(
+        policy_from_dict({"audit": {"path": str(tmp_path / "audit.jsonl")}}),
+        clock=lambda: next(clock),
+    )
+    key = "AKIA" + "IOSFODNN7EXAMPLE"
+    assert w.from_client(rpc(1, "resources/read", uri=f"s3://b/x?k={key}")).to_server
+    error = {"code": -32002, "message": f"resource not found: s3://b/x?k={key}"}
+    out = w.from_server({"jsonrpc": "2.0", "id": 1, "error": error})
+    assert out.to_client[0]["error"] == error  # the client still gets the server's answer
+
+    assert w.from_client(rpc(2, "prompts/get", name="nope")).to_server
+    out = w.from_server({"jsonrpc": "2.0", "id": 2, "error": {"code": -32602, "message": "x"}})
+    assert out.to_client[0]["error"]["code"] == -32602
+
+    read, prompt = audit_events(tmp_path)
+    assert read["event"] == "resource_read" and read["error"]["code"] == -32002
+    assert key not in json.dumps(read["error"]) and read["latency_ms"] == 250.0
+    assert prompt["event"] == "prompt_get" and prompt["prompt"] == "nope"
+    assert prompt["error"]["code"] == -32602 and prompt["latency_ms"] == 500.0
+
+
 def test_subscribing_to_a_denied_resource_is_not_found(tmp_path):
     w = make(tmp_path, **RESOURCE_RULES)
     out = w.from_client(rpc(1, "resources/subscribe", uri="file:///etc/passwd"))

@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import time
 from collections.abc import Awaitable, Callable, Collection, Sequence
 from typing import Any, BinaryIO
 
@@ -56,6 +57,10 @@ LIST_CHANGED = (
     "notifications/resources/list_changed",
     "notifications/prompts/list_changed",
 )
+
+
+def _since(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 2)
 
 
 class UpstreamError(RuntimeError):
@@ -678,19 +683,29 @@ class Gateway:
             return _error(client_id, -32602, "resources/read needs a uri")
         owners = self._owners(uri, self._serving(allowed, "resources"))
         reply: Message = _error(client_id, -32002, f"resource not found: {uri}")
+        # Only the last failure is audited: when a URI nobody listed is tried on each
+        # server in turn, the earlier "not found" answers are expected, not errors.
+        failure: tuple[str, Any, float] | None = None
         for name in owners:
             blocked = self.wardens[name].admit_resource(uri)
             if blocked is not None:
                 return {"jsonrpc": "2.0", "id": client_id, "result": blocked}
+            started = time.perf_counter()
             try:
                 answer = await self.upstreams[name].call("resources/read", {"uri": uri})
             except UpstreamError as exc:
                 reply = _error(client_id, -32000, f"mcp-warden upstream error: {exc}")
+                failure = (name, reply["error"], _since(started))
                 continue
             if "result" in answer:
-                result = self.wardens[name].filter_resource(uri, answer["result"])
+                warden = self.wardens[name]
+                result = warden.filter_resource(uri, answer["result"], latency_ms=_since(started))
                 return {"jsonrpc": "2.0", "id": client_id, "result": result}
             reply = {**answer, "id": client_id}
+            failure = (name, answer.get("error"), _since(started))
+        if failure is not None:
+            name, error, latency_ms = failure
+            self.wardens[name].failed_resource(uri, error, latency_ms=latency_ms)
         return reply
 
     async def _subscribe(
@@ -827,13 +842,17 @@ class Gateway:
         blocked = self.wardens[server].admit_prompt(prompt)
         if blocked is not None:
             return {"jsonrpc": "2.0", "id": client_id, "result": blocked}
+        warden, started = self.wardens[server], time.perf_counter()
         try:
             answer = await self.upstreams[server].call("prompts/get", {**params, "name": prompt})
         except UpstreamError as exc:
-            return _error(client_id, -32000, f"mcp-warden upstream error: {exc}")
+            reply = _error(client_id, -32000, f"mcp-warden upstream error: {exc}")
+            warden.failed_prompt(prompt, reply["error"], latency_ms=_since(started))
+            return reply
         if "result" not in answer:
+            warden.failed_prompt(prompt, answer.get("error"), latency_ms=_since(started))
             return {**answer, "id": client_id}
-        result = self.wardens[server].filter_prompt(prompt, answer["result"])
+        result = warden.filter_prompt(prompt, answer["result"], latency_ms=_since(started))
         return {"jsonrpc": "2.0", "id": client_id, "result": result}
 
     async def list_tools(self, allowed: Collection[str] | None = None) -> list[Message]:

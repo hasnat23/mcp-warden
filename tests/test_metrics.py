@@ -37,6 +37,7 @@ def test_counts_decisions_findings_and_latency():
     sink(
         {"event": "resource_read", "server": "fs", "uri": "x", "decision": "allow", "blocked": True}
     )
+    sink({"event": "prompt_get", "server": "fs", "decision": "allow", "error": {"code": -32602}})
     sink({"event": "tools_list", "server": "fs", "hidden": ["add"]})
     sink({"event": "something_else"})
     got = samples(sink.render())
@@ -48,6 +49,7 @@ def test_counts_decisions_findings_and_latency():
     requests = "mcp_warden_requests_total"
     assert got[f'{requests}{{server="fs",method="sampling/createMessage",decision="deny"}}'] == 1
     assert got[f'{requests}{{server="fs",method="resources/read",decision="content_blocked"}}'] == 1
+    assert got[f'{requests}{{server="fs",method="prompts/get",decision="error"}}'] == 1
     assert got['mcp_warden_hidden_tools_total{server="fs"}'] == 1
     assert got['mcp_warden_redactions_total{server="fs"}'] == 2
     assert got['mcp_warden_findings_total{server="fs",rule="MW001",severity="high"}'] == 1
