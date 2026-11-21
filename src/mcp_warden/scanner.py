@@ -96,10 +96,14 @@ RULES: tuple[Rule, ...] = (
         "exfiltration",
         Severity.MEDIUM,
         re.compile(
-            r"\b(send|post|upload|forward|transmit|exfiltrate|leak)\b.{0,60}"
-            r"(https?://|\bwebhook\b|\b[\w.-]+@[\w-]+\.[\w.]+\b|\bsidenote\b)|"
-            r"\b(pass|put|place|include|embed)\b.{0,60}\b(contents?|keys?|tokens?|passwords?|"
-            r"secrets?|credentials?)\b.{0,40}\b(param(eter)?|argument|field|sidenote)\b",
+            # "send ... to <url|webhook|address>" on one line. Without the "to", a link after
+            # "blog post" or "will send an [event](https://...)" in docs would match.
+            r"\b(send|post|upload|forward|transmit|exfiltrate|leak)\b(?!-)[^\n]{0,60}?"
+            r"(\b(to|into|at|via)\s+((the|this|that|an?|our|my|your)\s+)?[<\[(`'\"]?"
+            r"(https?://|webhook\b|[\w.-]+@[\w-]+\.[\w.]+\b)|\bsidenote\b)|"
+            r"\b(pass|put|place|include|embed)\b[^\n]{0,60}\b(contents?|keys?|tokens?|"
+            r"passwords?|secrets?|credentials?)\b[^\n]{0,40}\b(param(eter)?|argument|field|"
+            r"sidenote)\b",
             _I,
         ),
         "instructs data to be sent somewhere or smuggled through a parameter",
@@ -134,8 +138,16 @@ def _decode_tag_chars(text: str) -> str:
     return "".join(chr(ord(c) - 0xE0000) for c in text if 0xE0020 <= ord(c) <= 0xE007E)
 
 
-def scan_text(text: str, *, tool: str | None = None, location: str | None = None) -> list[Finding]:
-    """Run every rule over one piece of text."""
+def scan_text(
+    text: str, *, tool: str | None = None, location: str | None = None, content: bool = False
+) -> list[Finding]:
+    """Run every rule over one piece of text.
+
+    ``content`` marks data rather than a tool definition: a result, resource or prompt.
+    Files and web pages mention ``.env`` or ``~/.aws/credentials`` all the time (a
+    ``.gitignore``, setup docs), so there a sensitive path on its own is MEDIUM and only
+    counts as HIGH next to an exfiltration instruction.
+    """
     findings: list[Finding] = []
     invisible = _INVISIBLE.findall(text)
     if invisible:
@@ -146,22 +158,27 @@ def scan_text(text: str, *, tool: str | None = None, location: str | None = None
         findings.append(Finding("MW005", Severity.HIGH, detail, tool, location, _visible(text)))
         # Scan the smuggled text too, so the real directive gets its own finding.
         if hidden:
-            findings.extend(scan_text(hidden, tool=tool, location=f"{location}#hidden"))
+            findings.extend(
+                scan_text(hidden, tool=tool, location=f"{location}#hidden", content=content)
+            )
 
     normalized = unicodedata.normalize("NFKC", _INVISIBLE.sub("", text))
-    for rule in RULES:
-        match = rule.pattern.search(normalized)
-        if match:
-            findings.append(
-                Finding(
-                    rule.id,
-                    rule.severity,
-                    f"{rule.name}: {rule.message}",
-                    tool,
-                    location,
-                    _visible(match.group(0)),
-                )
+    matches = [(rule, m) for rule in RULES if (m := rule.pattern.search(normalized))]
+    exfiltration = any(rule.id == "MW007" for rule, _ in matches)
+    for rule, match in matches:
+        severity = rule.severity
+        if content and rule.id == "MW004" and not exfiltration:
+            severity = Severity.MEDIUM
+        findings.append(
+            Finding(
+                rule.id,
+                severity,
+                f"{rule.name}: {rule.message}",
+                tool,
+                location,
+                _visible(match.group(0)),
             )
+        )
     return findings
 
 
@@ -235,7 +252,9 @@ def scan_result(result: Any, tool: str | None = None) -> list[Finding]:
         return findings
     for i, block in enumerate(result.get("content") or []):
         if isinstance(block, dict) and isinstance(block.get("text"), str):
-            findings.extend(scan_text(block["text"], tool=tool, location=f"content[{i}]"))
+            findings.extend(
+                scan_text(block["text"], tool=tool, location=f"content[{i}]", content=True)
+            )
     return findings
 
 

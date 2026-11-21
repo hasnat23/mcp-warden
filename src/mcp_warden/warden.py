@@ -406,7 +406,7 @@ class Warden:
                 out = {**msg, "params": params}
             if self.policy.scan_results != "off":
                 for location, text in _request_texts(method, out.get("params")):
-                    findings.extend(scan_text(text, location=location))
+                    findings.extend(scan_text(text, location=location, content=True))
                 self.findings.extend(findings)
             if self.policy.scan_results == "block" and any(
                 f.severity >= self.policy.block_severity for f in findings
@@ -562,7 +562,7 @@ class Warden:
         if self.policy.scan_results != "off":
             for location, block in blocks(out):
                 if isinstance(block.get("text"), str):
-                    findings.extend(scan_text(block["text"], location=location))
+                    findings.extend(scan_text(block["text"], location=location, content=True))
             self.findings.extend(findings)
         blocked = (
             self.policy.scan_results == "block"
