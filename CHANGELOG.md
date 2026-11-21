@@ -66,6 +66,12 @@ All notable changes to this project are documented here. The format follows
   it under `decision="error"`.
 
 ### Fixed
+- Fewer false positives on ordinary content, found by fetching 15 popular READMEs and
+  `.gitignore` files through the reference `fetch` server. MW007 now needs "send ... to"
+  a URL, webhook or address on one line, so links after "blog post" or "will send an
+  [event](https://...)" no longer match. In results, resources and prompts, MW004 alone is
+  medium, so `scan.results: block` no longer withholds a `.gitignore` that lists `.env` or
+  a guide that says where `~/.aws/credentials` lives; next to MW007 it stays high.
 - Error messages in audit records are redacted like results, since a server can echo the
   secret it was asked for back in the error.
 - `serve` reads the body of a request it rejects (401, 403, 404) before answering. The

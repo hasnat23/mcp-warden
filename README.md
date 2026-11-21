@@ -225,7 +225,7 @@ Start new deployments in `mode: monitor`, read the audit log for a few days, the
 | MW001 | high | Instruction override ("ignore previous instructions") |
 | MW002 | high | Pseudo-markup directive tags (`<IMPORTANT>`, `<SYSTEM>`, `<secret>`) |
 | MW003 | high | Concealment ("do not tell the user") |
-| MW004 | high | References to credentials and sensitive files (`~/.ssh`, `.env`, `mcp.json`) |
+| MW004 | high | References to credentials and sensitive files (`~/.ssh`, `.env`, `mcp.json`). Medium in results, resources and prompts unless paired with MW007, since files and docs mention them all the time |
 | MW005 | high | Invisible or bidi Unicode; ASCII hidden in Unicode tag characters is decoded and re-scanned |
 | MW006 | medium | Tool shadowing ("when calling the `send_email` tool, ...") |
 | MW007 | medium | Exfiltration (send to a URL or email, smuggle data through a parameter) |
